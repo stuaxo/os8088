@@ -259,6 +259,19 @@ def capabilities():
     # needs one from somewhere, and this is the one apt has.
     if shutil.which("dosbox"):
         caps.add("dosbox")
+    # A REAL DOS TO BOOT, for tests/dosguest.py. DOSBox above is not it: it
+    # emulates DOS and cannot host a program that takes the machine over. This
+    # is FreeDOS's boot floppy, which tools/getfreedos.py fetches at a pinned
+    # SHA-256 and never commits. The pinned IMAGE is probed and not the
+    # directory, for the reason the `cc` probe gives: a half-finished fetch must
+    # skip a row, not fail it.
+    sys.path.insert(0, os.path.join(ROOT, "tools"))
+    try:
+        import getfreedos
+        if getfreedos.have():
+            caps.add("freedos")
+    except Exception:
+        pass
     # WIREFRAME is an instrument and does not ship (SPEC.md 78.9), so `all`
     # builds wire.o88 and NO shipped floppy carries it - the disk comes from
     # `make wiredisk` and nothing in the suite runs that. Without this, the

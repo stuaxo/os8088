@@ -4200,6 +4200,25 @@ SOAK = [
         "without vstart=0, a near `ret` under a FAR call, and the ON-DISK "
         "record offsets read out of a SYNTHESIZED entry.",
         needs=("marty",), serial=True),
+    Row("dosguest", "soak", py("tests/dosguest.py"), 60.0,
+        "DOS IS SUSPENDED TO A FILE AND PUT BACK (docs/plans/DOSGUEST-PLAN.md "
+        "wave 1): dosguest/dg.asm, under a REAL FreeDOS in QEMU, takes a hidden "
+        "block off the top of the arena (int 12h then answers the smaller "
+        "machine), writes memory to a swap file with raw int 13h from the "
+        "block, gives the live IVT the ROM's vectors, wipes memory and "
+        "restores it. THREE PARTIES AGREE and none is the one under test: the "
+        "guest, tools/dgfat.py (a FAT reader sharing nothing with it) which "
+        "must find the same extents, and this row, which regenerates the "
+        "pattern on the host and finds it in the swap file READ OFF THE DISK "
+        "AFTER THE GUEST HAS GONE. A restore that worked proves the stub can "
+        "read back what it wrote; it does not prove the file holds the "
+        "machine. Also asserts the snapshot holds DOS's own vectors and the "
+        "ORIGINAL memory size (it is taken before either changes), and has "
+        "three negative controls: a flipped bit, a wrong offset, and the "
+        "launcher built with the restore left out, which must not come back. "
+        "SOAK: it boots a guest, and needs a DOS that is fetched, not shipped "
+        "(`python3 tools/getfreedos.py`)",
+        needs=("nasm", "qemu", "mtools", "freedos")),
     Row("kdos", "soak", py("tests/kdos.py"), 10.0,
         "A DOS PROGRAM RUNS OUTSIDE THE KERNEL "
         "(docs/plans/KERN-DOS-PLAN.md W4, SPEC.md 96.38): W3 got the disk "

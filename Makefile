@@ -5392,6 +5392,21 @@ $(BUILD)/MREDRAW.COM: tests/dostrap/mredraw.asm | $(BUILD)
 $(BUILD)/mredraw360.img: $(BUILD)/MREDRAW.COM tools/os88disk.py
 	python3 tools/os88disk.py -o $@ --size 360 $(BUILD)/MREDRAW.COM
 
+# =============================================================================
+# `make dosguest` - THE LAUNCHER THAT STARTS os8088 FROM DOS (docs/plans/DOSGUEST-PLAN.md)
+# =============================================================================
+# Wave 1: build/DG.COM suspends a DOS machine to a file and restores it, with no
+# os8088 in it. NOT in `all` - nothing ships it yet - and not linked to the
+# kernel: it is a DOS program, assembled flat like every other .COM here.
+# `python3 tests/dosguest.py` runs it under a real FreeDOS in QEMU, which
+# `python3 tools/getfreedos.py` fetches (and never commits: build/ is ignored).
+.PHONY: dosguest
+dosguest: $(BUILD)/DG.COM
+
+$(BUILD)/DG.COM: dosguest/dg.asm | $(BUILD)
+	$(NASM) -f bin -w+error -o $@ $<
+	@echo "dosguest: $(call FILESIZE,$@) bytes - python3 tests/dosguest.py runs it"
+
 .PHONY: kdostest
 kdostest: $(IMG360) $(IMG720) $(IMG) $(BUILD)/doscom360.img $(BUILD)/doscom144.img $(BUILD)/cwdsub.img $(BUILD)/dosbig144.img $(BUILD)/condev360.img $(BUILD)/wrgap360.img $(BUILD)/mouevt360.img $(BUILD)/attrdir360.img $(BUILD)/mcursor360.img $(BUILD)/mredraw360.img
 	@echo "kdostest: the SHIPPED system disks already carry kern_dos as a part"

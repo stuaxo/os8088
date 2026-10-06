@@ -1,6 +1,6 @@
 # `dosguest` - starting os8088 from DOS, and returning to it
 
-**Status: PLAN. Nothing is built.**
+**Status: wave 1 is built and passing (section 12). Waves 2 to 6 are plan.**
 
 **The ask:** run os8088 from a DOS prompt, and exit back to that prompt with
 DOS as it was. The first version takes the whole machine. A later version lets
@@ -104,10 +104,15 @@ let os8088 lose 1 KB.
    the volume start, geometry. The same facts the resume stub already takes
    (SPEC.md 87.5, step 1).
 3. **Allocate the hidden block** (3.3).
-4. **Write the swap image** with DOS calls, to a file in the root of that
-   volume, before anything is torn down. Layout as `HIBERNAT.IMG`
+4. **Allocate the swap file with DOS, fill it with raw `int 13h`.** DOS
+   creates `\DGSWAP.IMG` at the image's size so that it owns the clusters.
+   The image itself is then written by the stub, from the hidden block, with
+   raw `int 13h`. **It is not written through DOS**: a DOS write changes DOS's
+   own state (SFT, buffers) while the image is being captured, and the result
+   would be a snapshot no instant ever held (SPEC.md 87.4 writes through the
+   kernel's own layer for the same reason). Layout as `HIBERNAT.IMG`
    (SPEC.md 87.3): no header, file offset n is linear address n, from 0 to
-   the hidden block's base.
+   the image's top, which is the hidden block's base rounded down to 16 KB.
 5. **Flush DOS.** INT 21h AH=0Dh. Flush a write-behind cache if present
    (SMARTDRV: INT 2Fh AX=4A10h). The swap file's clusters must be on disk
    before the stub reads them with `int 13h`.
@@ -133,28 +138,42 @@ ROM. Under DOS they may point at a TSR or a resident driver in memory os8088
 has just overwritten, and the first tick jumps into garbage. The other hardware
 vectors (IRQ 3/4, 5, 7, 10 to 15) have the same problem, quietly.
 
+**What wave 1 found, on a stock FreeDOS 1.4 (section 12):** every hardware
+vector is in RAM. FreeDOS wraps IRQ 08h to 0Fh and 70h to 77h in stubs inside
+its kernel segment, and the "refuse if the vector is in RAM" rule I first
+wrote would refuse a stock FreeDOS every time. The stubs keep the original ROM
+vector inline, so it can be recovered.
+
 **Policy for version 1, with no kernel change:**
 
-1. For each hardware vector, look at its target segment.
-2. **In ROM** (segment at or above C000): leave it. It is the BIOS or an
-   option ROM, and os8088 can chain to it as after a BIOS boot.
-3. **In RAM:** a TSR owns it. The launcher **refuses**, naming the vector and
-   the owning program (the MCB owner of that segment), and says to unload
-   it. This is honest and has no way to crash.
-4. Mask every IRQ os8088 does not enable. Restore the PIC masks on return.
+1. **DOS's own vectors stay in the swap image.** They come back on the resume.
+   The launcher never edits them in place.
+2. **The launcher builds a CLEAN set** of the 16 hardware vectors (08h to 0Fh,
+   70h to 77h) and the stub writes it into the live IVT **after** the
+   snapshot. That is what os8088 is handed, so `sch_hook` and `mouse_init`
+   chain to ROM as after a BIOS boot.
+3. **For each vector:** in ROM (segment at or above C000), it is its own clean
+   value. Otherwise follow it, up to eight links, through the two shapes that
+   keep the previous vector inline:
+   - the **IBM Interrupt Sharing Protocol** header, `EB 10 | dd old | 'KB'`
+     (FreeDOS uses it for IRQ 2 to 7 and 70h to 77h, and so do many TSRs);
+   - **FreeDOS's wrapper**, `E8 rel16 | dd old` (IRQ 0 and 1).
+4. **Anything else in RAM is a TSR the launcher cannot see through.** It
+   refuses, naming the vector and where it points.
+5. **INT 13h itself has to be in ROM.** The stub's disk service is the only
+   way back and calls it through a saved far pointer.
+6. **During the restore the IVT is the first thing overwritten**, and the BIOS
+   disk code takes IRQ 6 and IRQ 14 through INT 0Eh and INT 76h. Those two
+   would point into DOS code not yet restored. The stub re-applies the clean
+   values for those two before **every** `int 13h` of the restore, and puts
+   DOS's back at the end.
+7. Mask every IRQ except the disks' (6, 14 and the cascade) while the stub
+   runs. Restore the PIC masks.
 
-Real MS-DOS leaves INT 08h and INT 09h in the ROM (SPEC.md 96.50 records INT 09h
-at F000:E987 under IBM DOS 3.30), so on a clean DOS this
-passes. On a DOS with ANSI.SYS, a keyboard layout driver, a mouse driver or a
-disk cache it will often refuse. That makes it narrow, not useless.
-
-**If refusal proves too common**, the relief is a thunk in the hidden block
-that does what the ROM handler would have done: for INT 08h, bump the BDA tick
-count, send the EOI and `iret`; for INT 09h, it must reimplement scancode
-handling or find the ROM entry. The ROM's own entry points are the usual
-answer (F000:FEA5, F000:E987 on IBM-compatibles), checked against the BIOS
-identification. That is later work and still outside the kernel. The kernel
-host flag is the last resort and is **not planned**.
+Still open: a TSR that hooks INT 08h or 09h without either shape. That is the
+case the earlier draft's thunk was for. `INT 15h` is unchecked: a BIOS disk
+call may chain through it (HIMEM hooks it), and a stub that runs HIMEM's code
+mid-restore is a crash. W4 tests it.
 
 ### 4.3 Hardware state not in the image
 
@@ -307,7 +326,7 @@ the launcher asks for it.
 | wave | what | gate |
 |---|---|---|
 | W0 | Answer open questions 1 and 2 on paper: how the kernel picks volumes, what `kmain` assumes of stage 2. Confirm `int 12h` is the only source of `mem_top` and that nothing reads the BDA word directly. Decide whether v1 touches the kernel. | this document updated |
-| W1 | Launcher: refuse unsafe hosts, allocate the hidden block, write and verify the swap image, build the extent list. No os8088. | a DOS program restores itself byte for byte from the stub |
+| W1 | **DONE.** Launcher: hidden block, swap file, extent list, stub, vector policy. No os8088. `dosguest/dg.asm`, `tests/dosguest.py` | a DOS machine restores itself byte for byte, and the swap file read back off the disk holds it |
 | W2 | Vector policy (4.2) and hardware state (4.3). Enter os8088 with the stage-1 stand-in. Exit by Restart. | boots to the desktop under a DOS in QEMU and MartyPC; Restart returns to the prompt |
 | W3 | Read-only enforcement (5). | a write to the host volume is refused; the host `CHKDSK` is clean afterwards |
 | W4 | A TSR and a disk cache on the host: refuse or survive, as designed. | `docs/TESTING.md` rows |
@@ -338,3 +357,55 @@ points, to be checked there before relying on them:
 - The swap round trip is a byte comparison and does not need a display.
 - Anything about timing off MartyPC's hard disk is not quotable
   (`docs/TESTING.md`, KERN-DOS-PLAN 2.2).
+
+## 12. Wave 1: what was built and what it found
+
+`dosguest/dg.asm` (8 KB `.COM`, 8086 code) and `tests/dosguest.py`, run under
+stock FreeDOS 1.4 in QEMU (`python3 tools/getfreedos.py` fetches the boot
+floppy at a pinned SHA-256 and never commits it; `make dosguest` builds
+`build/DG.COM`). Nothing in os8088 changed.
+
+What the launcher does, in the order it does it: refuse DOS older than 3.31;
+build the clean vector set (4.2); take the hidden block from the top of the
+arena with last-fit allocation; copy the stub into it; fill every free
+paragraph with a pattern; make `\DGSWAP.IMG` through DOS; read the BPB with
+INT 25h's packet form; find the BIOS unit by comparing the volume's boot sector
+as DOS read it with the BIOS's, for units 80h up; find the file's extents by
+walking the FAT itself; then call the stub, which writes the image with raw
+`int 13h`, saves DOS's vectors, applies the clean set, lowers `0040:0013` and
+returns. The test then calls the stub's second entry, which fills memory with
+`0xCC` and restores. The stub returns a second time into the same place with
+`AX=1`, the way `setjmp` does.
+
+**Result on FreeDOS 1.4 / QEMU (SeaBIOS), 8 MB:** 639 KB visible before, 624 KB
+while hidden, 639 KB after. A 489 KB pattern came back with 0 mismatches and
+the IVT with 0. The swap file is one contiguous run of 1,248 sectors. The
+snapshot holds the original memory size and DOS's own INT 08h
+(`0070:000F`), not the clean one, which is the point of taking it first.
+`tools/dgfat.py`, a FAT reader that shares nothing with the guest, finds the
+same extent, and the pattern regenerated on the host is found in the swap file
+read off the disk after the guest has gone.
+
+**Findings that changed the design:**
+
+1. **Stock FreeDOS wraps every IRQ vector in RAM** (4.2). The refuse-on-RAM
+   rule was wrong for it. The clean set is built by unwrapping.
+2. **The image must not be written through DOS** (4.1).
+3. **The restore overwrites the IVT first, and the BIOS needs two of those
+   vectors to finish the disk call** (4.2, point 6).
+4. **The BIOS cursor lives in the BDA**, which the restore rewrites, so a mark
+   printed after the resume lands on top of one printed before it. A debug
+   build (`-DDEBUG`) that prints a letter per step looks wrong for that reason
+   and is not.
+5. **The image is rounded down to 16 KB**, so up to 16 KB below the hidden
+   block is in neither the snapshot nor os8088's machine. It is untouched, so
+   DOS is unharmed, but os8088 loses it. Rounding to 1 KB needs the swap file
+   written in 1 KB-aligned chunks; a later optimisation.
+
+**Not done, and not claimed:** XT or 8086 (QEMU only, so the CPU is a 386 running
+8086 code); any DOS but FreeDOS; any BIOS but SeaBIOS; a hard-disk
+partition table (the test volume is unpartitioned, so the BIOS-unit search was
+only exercised at hidden sector 0); FAT32 and partitions over 32 MB (the
+launcher refuses them); drive letters that are not the current drive's
+volume; large-disk CHS (the stub refuses a cylinder above 1023); video state,
+DOS's timer tick, and the extended-memory refusal of 4.5.
