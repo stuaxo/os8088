@@ -11,6 +11,13 @@ This is the mirror image of `docs/plans/KERN-DOS-PLAN.md`. `kern_dos` leaves
 os8088 for a DOS program and comes back. `dosguest` leaves DOS for os8088 and
 comes back.
 
+## Decisions taken
+
+| decision | by | consequence |
+|---|---|---|
+| Version 1 treats every DOS-visible volume as read-only | owner | Section 5 |
+| **Suspend and rehydrate live outside os8088**, in the launcher | owner | os8088 learns nothing about DOS. Section 3 |
+
 ---
 
 ## 1. Summary
@@ -18,34 +25,72 @@ comes back.
 1. **os8088 cannot coexist with DOS in conventional memory.** The kernel
    is at 0000:0600 (`KERNEL_SEG` 0x0060, SPEC.md 2) and every package's far
    calls are baked against that address. DOS is resident in the same bytes.
-2. **So DOS is swapped out.** A launcher writes conventional memory to a file,
-   boots os8088, and on exit reads it back. SPEC.md 87 (Hibernate) already does
-   this for os8088's own memory. It supplies the image format, the stub that
-   runs from video RAM, and the extent-list reader.
-3. **The hazard is not the memory. It is the interrupt vectors and the disk.**
-   Sections 4 and 5.
-4. **Version 1 treats every DOS-visible volume as read-only.** Section 5.
-5. **Version 2 (separate PR) is a pass-through `.DRV`.** Section 8.
+2. **So DOS is swapped out, by the launcher.** It writes memory to a file,
+   boots os8088, and a stub it left behind reads the file back.
+3. **The launcher hides a block of top RAM from os8088** by lowering the BIOS
+   memory size (`0040:0013`, which is what `int 12h` returns). os8088 sizes
+   itself from `int 12h` (`kernel/memory.inc`, `boot/boot.asm`), so it never
+   touches the block. The block holds the return stub, so nothing needs
+   to survive in video RAM, which the CGA and Hercules framebuffers would
+   overwrite.
+4. **Exit is os8088's existing Restart.** It ends in a software `int 19h`
+   (`kernel/ui.inc`, `ui_cmd_reboot`). The launcher points the IVT's INT 19h
+   entry into the hidden block, so Restart returns to DOS.
+5. **Expected kernel change in version 1: none.** Section 4.2 is the one place
+   this could fail.
+6. **Version 2 (separate PR) is a pass-through `.DRV`.** Section 8.
 
 ## 2. Terms
 
 | term | meaning |
 |---|---|
 | launcher | the DOS program (`OS8088.COM` or `.EXE`) that the user types |
-| swap image | conventional memory, linear 0 to the top of DOS memory, in a file |
-| stub | the short routine copied into video RAM that does I/O with `int 13h` while nothing else is in memory (SPEC.md 87.5) |
+| swap image | the saved DOS memory, in a file |
+| hidden block | top-of-memory RAM the launcher removes from the BIOS memory size |
+| return stub | code in the hidden block that reads the swap image back and resumes DOS |
 | host | the DOS machine os8088 was started from |
 
-## 3. Why swap, and not "load above DOS"
+## 3. Shape
+
+### 3.1 Why swap, and not "load above DOS"
 
 Loading os8088 above DOS needs `KERNEL_SEG` to be a runtime value. SPEC.md 2
 records that it is a constant in three places, one of which is baked into every
-`.o88`. Making it variable touches every package and every far-call target.
-That is a different and much larger change, and it gives a worse result: DOS
-and a 640 KB-designed OS would share the arena, and neither has room.
+`.o88`. Making it variable touches every package and every far-call target,
+and the result is a worse machine, with DOS and an OS designed for 640 KB
+sharing one arena.
 
-Swapping is also what `kern_dos` and Hibernate already do, so the mechanism is
-proven on real hardware (`docs/reports/KERN-DOS-BUDGET-2026-09-13.md`).
+### 3.2 Why the logic is outside os8088
+
+Everything that knows about DOS (the swap file, the FAT chain, the hardware
+state, the return) sits in the launcher and the return stub. os8088 sees a
+machine with slightly less RAM, a clean set of vectors, and a reboot that
+happens to land somewhere else. That keeps `KERN_BUDGET` untouched and keeps
+os8088 bootable on machines that have never heard of DOS.
+
+### 3.3 The hidden block
+
+1. The launcher allocates the block from DOS, from the top of the arena
+   (INT 21h AH=58h to set last-fit, then AH=48h), so DOS considers it owned.
+2. It sets `0040:0013` to the block's base in KB. From then on `int 12h`
+   answers a smaller machine.
+3. The block is **not** part of the swap image. It is the launcher's own
+   state, so there is nothing to overwrite and nothing to restore.
+4. On return, the image restore puts the original `0040:0013` back with the
+   rest of the BDA, and DOS owns the block again; the launcher frees it.
+
+The block holds:
+
+| contents | notes |
+|---|---|
+| return stub | reads the extent list, reads the image, restores hardware, jumps back |
+| extent list | LBA and length of each run of the swap file |
+| saved hardware state | section 4.3 |
+| vector thunks | section 4.2 |
+| the INT 19h entry | where Restart lands |
+
+Size is a few hundred bytes plus the extent list. Round up to a paragraph and
+let os8088 lose 1 KB.
 
 ## 4. Entering os8088
 
@@ -53,77 +98,84 @@ proven on real hardware (`docs/reports/KERN-DOS-BUDGET-2026-09-13.md`).
 
 1. **Refuse unsafe hosts.** Not real mode (Windows, EMM386 or QEMM in V86
    mode, a DPMI host): `smsw` bit 0 on a 286 or later, plus INT 2Fh AX=1600h.
-   An 8086 cannot be in V86, so it skips the check. Refuse if conventional
+   An 8086 cannot be in V86 so it skips the check. Refuse if conventional
    memory is below the os8088 floor.
-2. **Find the volume.** The launcher's own drive, via the BPB. Needs: unit,
-   LBA of the volume start, geometry. The same facts the resume stub already
-   takes (SPEC.md 87.5, step 1).
-3. **Write the swap image** with DOS calls, to a file in the root of that
-   volume, before anything is torn down. Size is linear 0 to top of memory
-   (INT 12h). Same shape as `HIBERNAT.IMG` (SPEC.md 87.3): no header, file
-   offset n is linear address n.
-4. **Flush DOS.** INT 21h AH=0Dh (disk reset). Flush a write-behind cache
-   if one is present (SMARTDRV: INT 2Fh AX=4A10h). The swap file's clusters
-   must be on disk before the stub reads them with `int 13h`.
-5. **Walk the swap file's FAT chain into an extent list.** Same code path as
-   SPEC.md 87.5. Contiguity is not required.
-6. **Save the host's hardware state** that is not in the image (section 4.3).
-7. **Put a clean machine in front of os8088** (section 4.2).
-8. **Load and enter os8088.** Section 4.4.
+2. **Find the volume.** The launcher's own drive, via the BPB: unit, LBA of
+   the volume start, geometry. The same facts the resume stub already takes
+   (SPEC.md 87.5, step 1).
+3. **Allocate the hidden block** (3.3).
+4. **Write the swap image** with DOS calls, to a file in the root of that
+   volume, before anything is torn down. Layout as `HIBERNAT.IMG`
+   (SPEC.md 87.3): no header, file offset n is linear address n, from 0 to
+   the hidden block's base.
+5. **Flush DOS.** INT 21h AH=0Dh. Flush a write-behind cache if present
+   (SMARTDRV: INT 2Fh AX=4A10h). The swap file's clusters must be on disk
+   before the stub reads them with `int 13h`.
+6. **Walk the swap file's FAT chain into an extent list** (SPEC.md 87.5).
+   Contiguity is not required.
+7. **Save hardware state** (4.3) into the hidden block.
+8. **Install the vector thunks and the INT 19h entry** (4.2, 6).
+9. **Load and enter os8088** (4.4).
+
+**Optimisation, not v1:** the image need not carry free memory. Walking the
+MCB chain, only allocated blocks, the MCB headers, the IVT and the BDA have
+to be saved. A typical DOS has under 100 KB in use against 640. It cuts the
+write and the read by most of their cost, at the price of the launcher
+understanding the arena.
 
 ### 4.2 The vectors (the central hazard)
 
-os8088 does not own the interrupt vectors on its own. At boot, `sch_hook`
+os8088 does not own the interrupt vectors on its own. At boot `sch_hook`
 reads INT 08h and keeps it as `sch_old08`, and every tick **chains to it first**
 (`kernel/sched.inc`, `sch_isr`). `mouse_init` does the same with INT 09h
-(`kernel/mouse.inc`). That is correct after a BIOS boot, where those vectors
-are ROM. Under DOS they may point at a TSR, a resident mouse driver, or
-anything else in the memory os8088 has just overwritten. The first tick then
-jumps into garbage.
+(`kernel/mouse.inc`). That is right after a BIOS boot, where those vectors are
+ROM. Under DOS they may point at a TSR or a resident driver in memory os8088
+has just overwritten, and the first tick jumps into garbage. The other hardware
+vectors (IRQ 3/4, 5, 7, 10 to 15) have the same problem, quietly.
 
-The other hardware vectors have the same problem in a quieter form: IRQ 3/4,
-5, 7, 10 to 15 and their vectors, which os8088 does not claim, can fire into
-overwritten code.
+**Policy for version 1, with no kernel change:**
 
-**Candidate fixes, in order of preference:**
+1. For each hardware vector, look at its target segment.
+2. **In ROM** (segment at or above C000): leave it. It is the BIOS or an
+   option ROM, and os8088 can chain to it as after a BIOS boot.
+3. **In RAM:** a TSR owns it. The launcher **refuses**, naming the vector and
+   the owning program (the MCB owner of that segment), and says to unload
+   it. This is honest and has no way to crash.
+4. Mask every IRQ os8088 does not enable. Restore the PIC masks on return.
 
-1. **A host flag in the handoff block, read by `sch_hook` and `mouse_init`.**
-   When set, the saved "old" vector is the launcher's one-instruction `iret`
-   thunk and not whatever is in the IVT, and os8088 keeps `[ticks]` and the
-   BDA tick count itself. Cost: a few bytes in the kernel image, on `kern_emu`
-   only if the budget requires (section 7).
-2. **Reinstall BIOS defaults.** The IBM-compatible entry points
-   (F000:FEA5 for IRQ 0 and so on) are common but not universal. Use only as
-   a cross-check, not as the mechanism.
-3. **Mask every IRQ except the ones os8088 enables**, so unclaimed vectors
-   never fire. Needed in any case; not sufficient alone, because the claimed
-   ones chain.
+Real MS-DOS leaves INT 08h and INT 09h in the ROM (SPEC.md 96.50 records INT 09h
+at F000:E987 under IBM DOS 3.30), so on a clean DOS this
+passes. On a DOS with ANSI.SYS, a keyboard layout driver, a mouse driver or a
+disk cache it will often refuse. That makes it narrow, not useless.
 
-Fix 1 plus 3 is the proposal. Fix 1 needs reading `sch_hook` and `mouse_init`
-closely, because both are on hot paths with a size budget (SPEC.md 15.1,
-`KERN_BUDGET`).
+**If refusal proves too common**, the relief is a thunk in the hidden block
+that does what the ROM handler would have done: for INT 08h, bump the BDA tick
+count, send the EOI and `iret`; for INT 09h, it must reimplement scancode
+handling or find the ROM entry. The ROM's own entry points are the usual
+answer (F000:FEA5, F000:E987 on IBM-compatibles), checked against the BIOS
+identification. That is later work and still outside the kernel. The kernel
+host flag is the last resort and is **not planned**.
 
 ### 4.3 Hardware state not in the image
 
-The image is memory only. The following are saved by the launcher and
-restored by the return stub (section 6), and each is an item to verify on a
-real machine and not assume:
+The image is memory only. The launcher saves the following into the hidden
+block, and the return stub restores it. Each is something to verify on a real
+machine, not to assume:
 
 | state | how | note |
 |---|---|---|
 | PIC masks, both | `in 21h` / `in A1h` | |
-| PIT channel 0 reload and mode | latch and read | os8088 reprograms it; the tick count in the BDA will drift by the time spent in os8088 |
+| PIT channel 0 reload and mode | latch and read | os8088 reprograms it; the BDA tick count drifts by the time spent in os8088 |
 | keyboard controller | drain the output buffer; restore the command byte if changed | |
-| video mode and cursor | `int 10h` AH=0Fh, AH=03h on return | graphics-mode hosts: text mode only in v1 |
-| video RAM | B800 (4 KB, or the active page set) | the stub itself uses it (SPEC.md 87.5), so it must be saved first |
-| A20 | read, restore | `kern_emu` has `XMEM.DRV`; see section 4.5 |
-| RTC, DMA | not saved in v1 | document as not preserved, as SPEC.md 87 does |
+| video mode and cursor | `int 10h` AH=0Fh, AH=03h; set on return | text-mode hosts only in v1 |
+| text video RAM | B800 (4 KB, active page) | the BIOS and os8088 will both have drawn on it |
+| A20 | read, restore | |
+| RTC, DMA | not saved in v1 | documented as not preserved, as SPEC.md 87 does |
 
-DOS drivers that own hardware (mouse, sound, network) keep state in the device
-that the image cannot restore. On return the launcher's resident return
-point calls the usual reset where one exists (INT 33h AX=0 for a mouse).
-Everything else is listed in the user-facing limits, as SPEC.md 87.4 lists its
-own.
+DOS drivers that own hardware (mouse, sound, network) keep state in the device,
+which the image cannot restore. On return the launcher calls the usual reset
+where one exists (INT 33h AX=0 for a mouse). The rest is listed in the user's
+limits, as SPEC.md 87.4 lists its own.
 
 ### 4.4 Loading os8088
 
@@ -132,135 +184,149 @@ os8088 boots in two stages (SPEC.md 2.9). Stage 1 reads the first
 CX, SI, BP and DI set from the volume's BPB. Stage 2 reads the rest.
 
 **The launcher stands in for stage 1.** It sets the same registers and jumps.
-This reuses stage 2 unchanged. The inputs it must supply are the unit, the
-geometry, the LBA of the data area, and the KSIG canary (`boot2.asm` header).
+This reuses stage 2 unchanged. The inputs are the unit, the geometry, the LBA
+of the data area, and the KSIG canary (`boot2.asm` header).
 
-**Open question 1:** `KERNEL.SYS` must be reachable by LBA from the stub's
-point of view. A DOS volume may carry it anywhere, fragmented. Stage 2's
-`read_run` takes a contiguous run. Options: require a contiguous file (check
-and refuse), give stage 2 an extent list as the stub already has, or let the
-launcher read the kernel itself with DOS calls and jump straight to the
-kernel entry. The third is simplest and costs nothing in os8088. It leaves
-stage 2 out entirely, so confirm that nothing in `kmain` depends on stage 2
-having run.
+**Open question 1:** `KERNEL.SYS` must be reachable by LBA. A DOS volume may
+carry it anywhere, fragmented, and stage 2's `read_run` takes a contiguous
+run. Options: require a contiguous file and refuse otherwise, extend stage 2 to
+take an extent list as the stub does, or have the launcher read the kernel
+itself with DOS calls and jump to its entry. The third is simplest and changes
+nothing in os8088, but skips stage 2, so it needs a check that `kmain` does
+not depend on stage 2 having run.
 
 ### 4.5 Memory above 1 MB
 
-The image does not cover extended memory (SPEC.md 87.7 draws the same line).
-A host may have HIMEM.SYS, a RAM drive, a SMARTDRV cache or the HMA in use,
-and os8088's `XMEM.DRV` would write over them.
+The image does not cover extended memory (SPEC.md 87.7 draws the same line). A
+host may have HIMEM.SYS, a RAM drive, a SMARTDRV cache or the HMA in use, and
+os8088's `XMEM.DRV` would write over them.
 
 v1 rule: **`XMEM.DRV` is not loaded under dosguest**, and the launcher refuses
-if the HMA is claimed. os8088 runs on conventional memory only. A later
-version can allocate through the XMS API and pass os8088 the range it owns.
+if the HMA is claimed. A later version can allocate through the XMS API and
+pass os8088 the range it owns.
 
-## 5. Disk consistency, and why v1 is read-only
+## 5. Disk consistency: v1 is read-only
 
 DOS keeps disk buffers and, on a hard disk, an in-memory FAT and directory
-cache. The swap image is a snapshot of those buffers at the moment of the
-swap. If os8088 changes the volume while it runs, DOS resumes with buffers
-that disagree with the disk, and the next write can corrupt the volume.
+cache. The swap image is a snapshot of those at the moment of the swap. If
+os8088 changes the volume, DOS resumes with buffers that disagree with the
+disk and the next write can corrupt it. A floppy's change line tells DOS; a
+hard disk's nothing does.
 
-For a floppy DOS notices a media change through the change line. For a hard
-disk nothing tells it.
+**Decided: os8088 treats every volume DOS can see as read-only and writes only
+to storage DOS does not hold** (a RAM disk, or a partition DOS has not mapped).
+The swap file is safe: DOS writes and flushes it before the swap, and os8088
+never touches it.
 
-**v1 rule: os8088 mounts every volume DOS can see read-only, and writes only
-to storage DOS does not hold.** That means a RAM disk, or a volume on a
-partition DOS has not mapped. os8088's own settings need a home that
-satisfies this.
+**Open question 2:** where to enforce read-only. The existing disk layer has
+per-volume write paths (`dskw_*`, SPEC.md 18). The narrowest place is likely a
+flag on the volume row. This is **a kernel change** and the one place the
+"no kernel change" claim is soft. Two ways out:
 
-**Open question 2:** the existing DRV layer has per-volume write control
-(`dskw_*`, SPEC.md 18). The task is to find the narrowest place to enforce
-read-only on a host volume. A `DVK_*` flag on the row is the likely shape.
+- **Enforce in the launcher.** Not evidently possible: the launcher has no way
+  to write-protect a hard disk, and none was found for a floppy.
+- **Do not mount it.** The launcher gives os8088 only its own boot volume and
+  removes the DOS volume from what os8088 sees. Needs reading how
+  `[dsk_bootvol]` and the hard-disk driver choose volumes (SPEC.md 52.10.3).
 
-A way to invalidate DOS's buffers on return (a device I/O call per drive, or
-setting the drive's media-changed state in the DPB) would allow v1.1 to relax
-this. It is DOS-version-specific and out of scope here.
+Resolve this in W0, before anything else, because it decides whether v1
+touches the kernel at all.
 
-The swap file itself is safe: DOS writes it and flushes before the swap
-(section 4.1, step 4), and os8088 never touches it.
+A way to invalidate DOS's buffers on return would let a later version relax
+this. It is DOS-version-specific and out of scope.
 
 ## 6. Exiting os8088
 
-1. A menu item, **Exit to DOS**, present only when the handoff block says
-   os8088 was started by dosguest. Same position as Hibernate (SPEC.md 12.1).
-2. The kernel's restart sweep runs: detach drivers, `drv_shutdown`,
-   `sched_unhook`, and give back INT 09h, as SPEC.md 87.4 step 7 does. Under
-   dosguest the vectors given back are the launcher's thunks (section 4.2),
-   not DOS's.
-3. Copy the return stub, its parameters and the extent list into video RAM.
-   Same stub as SPEC.md 87.5 with the payload reversed.
-4. The stub reads the swap image back to linear 0, over the IVT, the BDA and
-   everything else. This restores DOS's vectors with the rest of the image.
-5. Restore the section 4.3 state. Reload the video mode.
-6. Jump to the launcher's return point, which is inside the restored image.
-   It deletes the swap file with DOS, resets the devices it can, and exits
-   with the code os8088 passed (the exit code rides in the BDA; KERN-DOS-PLAN
-   8.2 measured that it survives).
+1. The user picks **Restart**. It is os8088's existing path (SPEC.md 87.4
+   step 7): detach drivers, `drv_shutdown`, `sched_unhook` (which gives INT
+   08h and 09h back), the floppy park, then a software `int 19h`.
+2. `int 19h` follows the IVT entry the launcher set (4.1 step 8) into the
+   hidden block. The return stub runs there.
+3. The stub reads the swap image back to linear 0 using `int 13h` and the
+   extent list, over the IVT, the BDA and everything os8088 left. The hidden
+   block is outside the image, so the stub is not overwritten while it runs.
+   DOS's vectors, including its own INT 19h, come back with the image.
+4. The stub restores the 4.3 state and the video mode.
+5. The stub jumps to the launcher's return point, inside the restored image.
+   The launcher frees the hidden block, deletes the swap file with DOS, resets
+   the devices it can, and exits to the prompt.
 
-**Failure.** If the swap file is unreadable or the extents are bad, the
-stub cannot restore DOS. It prints a message and waits for a key, then does
-`int 19h`. The swap file is left on disk and the launcher's next run offers to
-discard it, as the hibernate probe does (SPEC.md 87.5).
+**What the user sees:** Restart returns to DOS. There is no separate "Exit to
+DOS" item in v1. If that is confusing, a label change is a one-line follow-up
+that does not belong in this PR, and a menu item keyed on a handoff flag is
+the kernel change this design avoids.
+
+**What if the user wants a real reboot?** Restart cannot do both. v1 chooses
+DOS. Whether Ctrl-Alt-Del still reaches a real reboot while os8088 runs is
+untested.
+
+**Failure.** If the swap file is unreadable or the extents are bad, the stub
+cannot restore DOS. It prints a message and waits for a key, then reboots
+through the ROM (`jmp F000:FFF0`, not `int 19h`, which is ours). The swap
+file stays on disk; the launcher's next run notices it and offers to delete
+it.
 
 ## 7. Build
 
-- A separate `OS8088.COM`, built with the DOS toolchain this tree already has
-  (`docs/C-TOOLCHAIN.md`, or flat NASM). Not part of the kernel.
-- A small change to `sched.inc` and `mouse.inc` for the host flag (4.2). If
-  the footprint matters, it is `%ifdef KERN_EMU` or a new `KERN_DOSGUEST` kernel
-  family, like `make small` and `make emu` (SPEC.md 9.11.7). This is a decision
-  for whoever owns `KERN_BUDGET`. It is not a build fix.
-- A new disk image or folder layout: `OS8088.COM`, `KERNEL.SYS` and the
-  driver set, in one directory on a DOS volume.
+- A separate `OS8088.COM`, built with flat NASM like the rest of the tree. Not
+  part of the kernel.
+- Layout on a DOS volume: `OS8088.COM`, `KERNEL.SYS` and the driver set, in one
+  directory.
+- Kernel changes: **none expected**. The candidates, in the order they could
+  appear, are the read-only enforcement (5, open question 2) and, as a last
+  resort, a vector host flag (4.2). Either is `KERN_BUDGET`'s owner's call
+  and not a build fix.
 - Every Makefile and index change goes through `tools/os88index.py` and
   `make checkdocs`.
 
 ## 8. Version 2: DOS as a loadable backend
 
-**Not for this PR.** Recorded here so version 1 does not close the door.
+**Not for this PR.** Recorded so version 1 does not close the door.
 
-The aim: under dosguest, os8088 can read and write host files through DOS
-instead of treating the host disk as read-only. In normal operation nothing
-extra is resident.
+The aim: under dosguest, os8088 reads and writes host files through DOS. In
+normal operation nothing extra is resident.
 
-Shape, for later: a `DRVC_FILE`-class `.DRV` (SPEC.md 51), loaded only when
-the handoff block says dosguest. It would need DOS **and its memory**, which
-conflicts with section 3. Candidate approaches, none chosen:
+Shape, for later: a `DRVC_FILE`-class `.DRV` (SPEC.md 51), loaded only under
+dosguest. It needs DOS **and its memory**, which conflicts with 3.1. Candidate
+approaches, none chosen:
 
-1. **Keep a small part of DOS resident** in a reserved low region os8088 does
-   not claim, and call it through a real-mode trampoline. Needs a kernel
-   reservation, which `KERN_BUDGET` pays for.
+1. **Keep a small part of DOS resident** in the hidden block, called through a
+   real-mode trampoline. The hidden block is already the mechanism, so this
+   grows it. It costs os8088 whatever it grows by, and only under dosguest,
+   because the launcher decides the size.
 2. **Reload the swap image on demand.** Swap os8088 out and DOS in for each
-   call. Seconds per call (KERN-DOS-PLAN 2.2). Only suitable for rare
-   operations such as opening a file.
+   call. Seconds per call (KERN-DOS-PLAN 2.2). Only for rare operations.
 3. **Reimplement the host's FAT in the driver and invalidate DOS's caches on
    return.** Moves the section 5 problem rather than solving it.
 
-Section 5's resolution decides which of these is viable.
+The hidden block makes option 1 the natural one: the cost is paid only when
+the launcher asks for it.
 
 ## 9. Plan of work
 
 | wave | what | gate |
 |---|---|---|
-| W0 | Read `sch_hook`, `mouse_init`, `kmain`'s assumptions about stage 2 and about the IVT. Answer open questions 1 and 2 on paper. | this document updated |
-| W1 | Launcher: refuse unsafe hosts, write and verify the swap image, build the extent list. No os8088 yet. | a DOS test program restores itself byte for byte |
-| W2 | Enter os8088 with the clean-vector shim and stage-1 stand-in. Return by `int 19h` only. | boots to the desktop under a DOS in QEMU and in MartyPC |
-| W3 | The return path: stub, hardware state, launcher return point. | exit to DOS; a DOS program and a TSR both survive the round trip |
-| W4 | Read-only enforcement on host volumes. | a write to the host volume is refused; the host `CHKDSK` is clean afterwards |
-| W5 | Real hardware: 5150, an AT, and a machine with a TSR mouse driver and a disk cache. | `docs/FIELD-MACHINES.md` |
+| W0 | Answer open questions 1 and 2 on paper: how the kernel picks volumes, what `kmain` assumes of stage 2. Confirm `int 12h` is the only source of `mem_top` and that nothing reads the BDA word directly. Decide whether v1 touches the kernel. | this document updated |
+| W1 | Launcher: refuse unsafe hosts, allocate the hidden block, write and verify the swap image, build the extent list. No os8088. | a DOS program restores itself byte for byte from the stub |
+| W2 | Vector policy (4.2) and hardware state (4.3). Enter os8088 with the stage-1 stand-in. Exit by Restart. | boots to the desktop under a DOS in QEMU and MartyPC; Restart returns to the prompt |
+| W3 | Read-only enforcement (5). | a write to the host volume is refused; the host `CHKDSK` is clean afterwards |
+| W4 | A TSR and a disk cache on the host: refuse or survive, as designed. | `docs/TESTING.md` rows |
+| W5 | Real hardware: 5150, an AT, a machine with a mouse driver and a cache. | `docs/FIELD-MACHINES.md` |
+| W6 (optional) | MCB-aware image: skip free memory. | image size and round-trip time against the full image |
 
 ## 10. What would kill this
 
-- **A host whose BIOS vectors cannot be neutralised.** If fix 1 in 4.2 proves
-  too expensive for the kernel budget and fix 2 is unreliable, the launcher
-  can only work on a clean DOS with no hardware TSRs. That is a narrower
-  product, not no product.
-- **A disk cache that cannot be flushed from the outside.** A write-behind
-  cache with no flush entry point makes the swap image unsafe to read back
-  with `int 13h`. The launcher must refuse on such a host.
+- **Refusing too often.** If most real DOS setups have a RAM-resident hook on
+  INT 08h or 09h, the launcher works only on a clean DOS. The thunk fallback
+  in 4.2 is the answer, and it is real work.
+- **`int 12h` not being the only truth.** If the kernel, a driver or a package
+  reads RAM size from somewhere else, the hidden block is not hidden. W0
+  checks this.
+- **A disk cache that cannot be flushed from outside.** A write-behind cache
+  with no flush entry point makes the swap image unsafe to read back with
+  `int 13h`. The launcher refuses on such a host.
 - **A host with extended memory in use** where the XMS API cannot be reached
-  (4.5). This is only a v1 limit, not fatal.
+  (4.5). A v1 limit, not fatal.
 
 ## 11. Testing
 
