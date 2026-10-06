@@ -1,6 +1,6 @@
 # `dosguest` - starting os8088 from DOS, and returning to it
 
-**Status: wave 1 is built and passing (section 12). Waves 2 to 6 are plan.**
+**Status: waves 1 and 2 are built and passing (sections 12, 13): os8088 boots from a FreeDOS prompt and Restart returns to it. Waves 3 to 6 are plan.**
 
 **The ask:** run os8088 from a DOS prompt, and exit back to that prompt with
 DOS as it was. The first version takes the whole machine. A later version lets
@@ -198,21 +198,21 @@ limits, as SPEC.md 87.4 lists its own.
 
 ### 4.4 Loading os8088
 
-os8088 boots in two stages (SPEC.md 2.9). Stage 1 reads the first
-`BOOT2_SECS` sectors of `KERNEL.SYS` to `HEAP_SEG` and jumps in with DL, DH,
-CX, SI, BP and DI set from the volume's BPB. Stage 2 reads the rest.
+**The launcher does what a BIOS does at `int 19h`: it loads the floppy's boot
+sector to `0000:7C00` and jumps to it with `DL` set.** os8088's own stage 1 then
+runs unchanged: it relocates itself to the top of RAM (from `int 12h`, which
+is the hidden size), reads stage 2 and the kernel, and so on (SPEC.md 2.9).
 
-**The launcher stands in for stage 1.** It sets the same registers and jumps.
-This reuses stage 2 unchanged. The inputs are the unit, the geometry, the LBA
-of the data area, and the KSIG canary (`boot2.asm` header).
+This replaced the first idea, a launcher that stands in for stage 1 and
+hands stage 2 its registers. That needed the build's constants (`HEAP_SEG`,
+`BOOT2_SECS`, the KSIG canary) and a contiguous `KERNEL.SYS`, and it would have
+had to know about the packed kernel. Booting the sector needs none of it. It
+answers what was open question 1: **os8088 needs no extent list and no help
+from the launcher to load, because it loads itself.**
 
-**Open question 1:** `KERNEL.SYS` must be reachable by LBA. A DOS volume may
-carry it anywhere, fragmented, and stage 2's `read_run` takes a contiguous
-run. Options: require a contiguous file and refuse otherwise, extend stage 2 to
-take an extent list as the stub does, or have the launcher read the kernel
-itself with DOS calls and jump to its entry. The third is simplest and changes
-nothing in os8088, but skips stage 2, so it needs a check that `kmain` does
-not depend on stage 2 having run.
+Wave 2 is **floppy only** (`DG A:` or `DG B:`). A hard-disk os8088 boots through
+`boot/mbr.asm` and `boot/boothd.asm`, and the stub would load an MBR and pass a
+partition entry. That is later work.
 
 ### 4.5 Memory above 1 MB
 
@@ -327,7 +327,7 @@ the launcher asks for it.
 |---|---|---|
 | W0 | Answer open questions 1 and 2 on paper: how the kernel picks volumes, what `kmain` assumes of stage 2. Confirm `int 12h` is the only source of `mem_top` and that nothing reads the BDA word directly. Decide whether v1 touches the kernel. | this document updated |
 | W1 | **DONE.** Launcher: hidden block, swap file, extent list, stub, vector policy. No os8088. `dosguest/dg.asm`, `tests/dosguest.py` | a DOS machine restores itself byte for byte, and the swap file read back off the disk holds it |
-| W2 | Vector policy (4.2) and hardware state (4.3). Enter os8088 with the stage-1 stand-in. Exit by Restart. | boots to the desktop under a DOS in QEMU and MartyPC; Restart returns to the prompt |
+| W2 | **DONE, floppy and QEMU only.** Enter os8088 by booting its floppy's boot sector; exit by Restart; save and restore the DOS text screen. | boots to the desktop under FreeDOS in QEMU; Restart returns to the prompt (MartyPC and v86 not yet) |
 | W3 | Read-only enforcement (5). | a write to the host volume is refused; the host `CHKDSK` is clean afterwards |
 | W4 | A TSR and a disk cache on the host: refuse or survive, as designed. | `docs/TESTING.md` rows |
 | W5 | Real hardware: 5150, an AT, a machine with a mouse driver and a cache. | `docs/FIELD-MACHINES.md` |
@@ -409,3 +409,46 @@ only exercised at hidden sector 0); FAT32 and partitions over 32 MB (the
 launcher refuses them); drive letters that are not the current drive's
 volume; large-disk CHS (the stub refuses a cylinder above 1023); video state,
 DOS's timer tick, and the extended-memory refusal of 4.5.
+
+## 13. Wave 2: os8088 runs, and Restart brings DOS back
+
+`DG B:` with os8088's system floppy in B:. After the snapshot the stub saves
+the DOS text screen, loads B:'s boot sector to `0000:7C00`, points INT 19h at
+itself, unmasks the IRQs a BIOS leaves on, and jumps. os8088's Restart ends in
+`int 19h` (`kernel/ui.inc`, `ui_cmd_reboot`), which lands on the stub's second
+entry. That runs the same restore as the self-test, then sets the video mode
+and puts the saved screen and the cursor back.
+
+**Result, FreeDOS 1.4 / QEMU / the standard `build/os8088.img` (no kernel
+change, and not `emu.img`; dosguest does not need the VMware pointer):**
+
+- os8088 reaches its desktop under DOS and its own tick count advances.
+- **`mem_top`, read out of os8088's own RAM while it runs, is `0x9C00`, which is
+  624 KB times 64.** The machine has 639 KB. os8088 sized itself to the hidden
+  machine, which is the whole of "it cannot reach the block", read off os8088.
+- Restart takes it out. DOS's pattern, which os8088 had overwritten, is back
+  with 0 mismatches over 480 KB; the IVT is DOS's; `int 12h` is 639 KB again;
+  the BIOS tick moved by 161 ticks; `dir` and `ver` run; and the FreeCom banner
+  that was on the screen before the launcher is on it again.
+
+**Findings:**
+
+1. **Booting the sector is simpler and more general than standing in for
+   stage 1** (4.4).
+2. **Restart is the way home with no kernel change**, as the plan expected.
+   It means Restart no longer restarts the machine under dosguest.
+3. **The video state needs the hidden block to be 12 KB, not 4 KB.** The DOS
+   text screen is up to 8,000 bytes (80x50). os8088 loses 12 KB under dosguest.
+
+**Not done, and not claimed:**
+
+- **Read-only enforcement (5, open question 2).** Nothing stops os8088 writing
+  to a volume DOS can see. The test did not make os8088 write anything. This is
+  still wave 3, and is the largest remaining hazard.
+- **A negative control for the screen restore.** The banner check would fail
+  without it, but there is no build flag to prove it.
+- **The DOS clock.** The BDA tick is DOS's at the snapshot, so DOS's time loses
+  as long as os8088 ran. Easy to fix from the RTC; not done.
+- **Video state beyond the text screen:** a loaded font, the palette, other
+  pages, graphics-mode hosts. A host in a graphics mode is not detected.
+- **A hard-disk os8088, MartyPC, v86, a real 8086, a second DOS.**

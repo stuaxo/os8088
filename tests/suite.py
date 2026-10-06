@@ -4200,7 +4200,7 @@ SOAK = [
         "without vstart=0, a near `ret` under a FAR call, and the ON-DISK "
         "record offsets read out of a SYNTHESIZED entry.",
         needs=("marty",), serial=True),
-    Row("dosguest", "soak", py("tests/dosguest.py"), 60.0,
+    Row("dosguest", "soak", py("tests/dosguest.py"), 75.0,
         "DOS IS SUSPENDED TO A FILE AND PUT BACK (docs/plans/DOSGUEST-PLAN.md "
         "wave 1): dosguest/dg.asm, under a REAL FreeDOS in QEMU, takes a hidden "
         "block off the top of the arena (int 12h then answers the smaller "
@@ -4216,9 +4216,18 @@ SOAK = [
         "ORIGINAL memory size (it is taken before either changes), and has "
         "three negative controls: a flipped bit, a wrong offset, and the "
         "launcher built with the restore left out, which must not come back. "
-        "SOAK: it boots a guest, and needs a DOS that is fetched, not shipped "
-        "(`python3 tools/getfreedos.py`)",
-        needs=("nasm", "qemu", "mtools", "freedos")),
+        "WAVE 2 BOOTS os8088 FROM THE DOS PROMPT (`DG B:`): the stub loads the "
+        "floppy's boot sector to 0000:7C00 and jumps to it, as a BIOS does, so "
+        "os8088's own stage 1 runs unchanged, and Restart's int 19h is the way "
+        "home. Asserted off os8088 itself while it runs: its mem_top is the "
+        "HIDDEN size; and after Restart, off DOS: the pattern os8088 overwrote "
+        "is intact, the IVT is DOS's, the BIOS tick moved, `dir` works, and the "
+        "DOS screen from before the launcher is on the glass again (video RAM is "
+        "not in the image, so that is the stub's own save and restore). "
+        "SOAK: it boots two guests, and needs a DOS that is fetched, not "
+        "shipped (`python3 tools/getfreedos.py`)",
+        needs=("nasm", "qemu", "mtools", "freedos"),
+        wants=("build/os8088.img",)),
     Row("kdos", "soak", py("tests/kdos.py"), 10.0,
         "A DOS PROGRAM RUNS OUTSIDE THE KERNEL "
         "(docs/plans/KERN-DOS-PLAN.md W4, SPEC.md 96.38): W3 got the disk "

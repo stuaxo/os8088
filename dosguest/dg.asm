@@ -1,13 +1,14 @@
 ; =============================================================================
 ; os8088 - dosguest/dg.asm
 ;
-; THE LAUNCHER, WAVE 1 (docs/plans/DOSGUEST-PLAN.md 9): suspend DOS to a file,
-; trash what os8088 would trash, put DOS back and check it. There is no os8088
-; in this wave. The point is the part that has to be right before os8088 is
-; involved at all: the hidden block, the extent list and the return stub.
+; THE LAUNCHER, WAVES 1 AND 2 (docs/plans/DOSGUEST-PLAN.md 9): suspend DOS to a
+; file; then either trash what os8088 would trash and put DOS back (the
+; self-test), or BOOT os8088 from a floppy, and put DOS back when it Restarts.
 ;
-;   DG.COM        run the self-test; writes \DGRESULT.TXT and prints it
-;   DG.COM /K     ...and keeps \DGSWAP.IMG so the host can read it back
+;   DG.COM        the self-test, no os8088; writes \DGRESULT.TXT and prints it
+;   DG.COM B:     boot os8088 from the floppy in B: (or A:). Its Restart is the
+;                 way home: the launcher points INT 19h at the stub
+;   DG.COM /K     ...either way, keep \DGSWAP.IMG so the host can read it back
 ;
 ;   make dosguest            builds build/DG.COM
 ;   python3 tests/dosguest.py  runs it under FreeDOS in QEMU and checks the
@@ -36,9 +37,9 @@ bits 16
 org 0x100
 
 PAT_SEED    equ 0x1234              ; tests/dosguest.py regenerates the pattern from it
-HB_PARAS    equ 0x100               ; the hidden block: 4KB
+HB_PARAS    equ 0x300               ; the hidden block: 12KB (stub, extents, the DOS screen)
 MAXRUNS     equ 128                 ; extents; 6 bytes each
-ST_STACK    equ 0x0FF0              ; the stub's stack top, inside the block
+ST_STACK    equ 0x2FF0              ; the stub's stack top, inside the block
 SECBUF_LEN  equ 1024                ; FAT/dir/boot sector buffer (2 sectors)
 
 %macro MARK 1
@@ -65,6 +66,8 @@ pseg        dw 0                    ; the pattern block
 pparas      dw 0
 drive       db 0                    ; 0 = A
 keep        db 0
+bootmode    db 0                    ; 1 = boot os8088 from bootunit
+bootunit    db 0
 bad         dw 0                    ; pattern mismatches after the resume
 fatsec      dw 0xFFFF               ; the FAT sector in secbuf, if any
 fatsec_ok   db 0
@@ -96,6 +99,7 @@ swapname    db '\DGSWAP.IMG', 0
 resname     db '\DGRESULT.TXT', 0
 dirname     db 'DGSWAP  IMG'
 
+msg_boot    db 'DG: wave 2 boots os8088 from a floppy only: DG A: or DG B:', 13, 10, '$'
 msg_dos     db 'DG: needs DOS 3.31 or later', 13, 10, '$'
 msg_mem     db 'DG: cannot allocate the hidden block', 13, 10, '$'
 msg_swap    db 'DG: cannot write \DGSWAP.IMG', 13, 10, '$'
@@ -141,13 +145,32 @@ main:
     cmp al, 13
     je .cldone
     cmp al, '/'
+    je .sw
+    cmp al, ' '
+    je .cl
+    ; a letter and a colon: the drive os8088 is to boot from. FLOPPY ONLY in
+    ; wave 2 (A: or B:): a hard disk's boot is boot/boothd.asm behind an MBR.
+    mov ah, al
+    and ah, 0xDF
+    cmp byte [si], ':'
     jne .cl
+    sub ah, 'A'
+    cmp ah, 1
+    ja .badboot
+    mov [bootunit], ah
+    mov byte [bootmode], 1
+    inc si
+    jmp .cl
+.sw:
     lodsb
     and al, 0xDF
     cmp al, 'K'
     jne .cl
     mov byte [keep], 1
     jmp .cl
+.badboot:
+    mov dx, msg_boot
+    jmp fail
 .cldone:
     ; --- DOS 3.31+ for INT 25h's packet form --------------------------------
     mov ah, 0x30
@@ -232,6 +255,10 @@ main:
     jnz resumed
     ; --- first return: what os8088 would do to the machine ------------------
     MARK 'k'
+    cmp byte [bootmode], 0
+    je .trash
+    call far [cs:stub_boot_far]     ; never returns: Restart's int 19h does
+.trash:
     call far [cs:stub_trash_far]    ; never returns: the resume does
     mov dx, msg_stub
     jmp fail
@@ -451,6 +478,10 @@ install_stub:
     mov [es:blk_nruns], ax
     mov ax, [hseg]
     mov [es:blk_seg], ax
+    mov al, [bootunit]
+    mov [es:blk_bootunit], al
+    mov al, [bootmode]
+    mov [es:blk_bootmode], al
     pop es
     ; far pointers into the block
     mov ax, [hseg]
@@ -460,11 +491,14 @@ install_stub:
     mov [stub_trash_far+2], ax
     mov word [stub_rw_far], STUB_RW
     mov [stub_rw_far+2], ax
+    mov word [stub_boot_far], STUB_BOOT
+    mov [stub_boot_far+2], ax
     ret
 
 stub_suspend_far dw 0, 0
 stub_trash_far   dw 0, 0
 stub_rw_far      dw 0, 0
+stub_boot_far    dw 0, 0
 
 ; =============================================================================
 ; save_vectors: the ROM's int 13h, the PIC masks and the original memory size
@@ -1110,6 +1144,26 @@ report:                             ; ES = the block
     mov al, [es:blk_unit]
     call emit_hex8
     call emit_crlf
+    mov si, r_mode
+    call emit_str
+    mov al, [bootmode]
+    call emit_hex8
+    call emit_crlf
+    mov si, r_bfail
+    call emit_str
+    mov al, [es:blk_bootfail]
+    call emit_hex8
+    call emit_crlf
+    mov si, r_tick0
+    call emit_str
+    mov ax, [es:blk_snap_tick]
+    call emit_hex16
+    call emit_crlf
+    mov si, r_tick1
+    call emit_str
+    mov ax, [es:blk_ret_tick]
+    call emit_hex16
+    call emit_crlf
     mov si, r_nruns
     call emit_str
     mov ax, [es:blk_nruns]
@@ -1173,6 +1227,10 @@ r_unit   db 'unit=', 0
 r_ivt    db 'ivt_mismatches=', 0
 r_c08    db 'clean_int08=', 0
 r_nruns  db 'nruns=', 0
+r_mode   db 'bootmode=', 0
+r_bfail  db 'bootfail=', 0
+r_tick0  db 'tick_at_boot=', 0
+r_tick1  db 'tick_at_return=', 0
 r_run    db 'run=', 0
 r_bad    db 'mismatches=', 0
 r_pat    db 'pattern_paras=', 0
@@ -1228,9 +1286,13 @@ stub_start:
 STUB_SUSPEND equ 0
 STUB_TRASH   equ 3
 STUB_RW      equ 6
+STUB_BOOT    equ 9
+STUB_RETURN  equ 12
     jmp stub_suspend                ; +0   far call: write the snapshot
     jmp stub_trash                  ; +3   far call: trash, then restore
     jmp stub_rw                     ; +6   far call: DX:AX LBA, CX count
+    jmp stub_boot                   ; +9   far call: boot os8088; no return
+    jmp stub_return                 ; +12  INT 19h's target while os8088 runs
 
 ; ----- the block's data, at fixed offsets --------------------------------------
 blk_seg     dw 0
@@ -1262,6 +1324,14 @@ t_n         dw 0
 t_run       dw 0
 at_flag     db 0
 blk_err     dw 0
+blk_bootunit db 0
+blk_bootmode db 0
+blk_bootfail db 0
+blk_pad2    db 0
+blk_snap_tick dw 0
+blk_ret_tick dw 0
+scr_seg     dw 0
+scr_len     dw 0
 blk_fixirq  db 0
 blk_ivt_bad dw 0
 blk_clean   times 16 dd 0           ; the ROM vectors, 08-0F then 70-77
@@ -1536,12 +1606,15 @@ image_io:
 pic_quiet:
     in al, 0x21
     mov [cs:sv_m1], al
+    cmp byte [cs:at_flag], 0
+    je pic_set_quiet
+    in al, 0xA1
+    mov [cs:sv_m2], al
+pic_set_quiet:                      ; the same masks, without saving the live ones
     mov al, 0xBB                    ; IRQ6 and the cascade only
     out 0x21, al
     cmp byte [cs:at_flag], 0
     je .xt
-    in al, 0xA1
-    mov [cs:sv_m2], al
     mov al, 0xBF                    ; IRQ14 only
     out 0xA1, al
 .xt:
@@ -1657,6 +1730,11 @@ stub_trash:
     cmp bx, dx
     jb .win
     MARK 'f'
+    jmp restore_all
+
+; ----- restore_all: the whole of the way back, shared by the self-test's trash
+;       and by Restart's int 19h. On the stub's own stack, IRQs quiet.
+restore_all:
     ; the restore: the same extents, read. The IVT is the first thing it
     ; overwrites, and the disk's own IRQ vectors have to name ROM until it ends
     mov word [cs:blk_op], 2
@@ -1686,6 +1764,10 @@ stub_trash:
     mov es, ax
     mov ax, [cs:blk_orig_kb]
     mov [es:0x413], ax
+    cmp byte [cs:blk_bootmode], 0
+    je .novid
+    call restore_screen             ; os8088 left the card in a graphics mode
+.novid:
     call pic_back
     mov ss, [cs:sv_ss]
     mov sp, [cs:sv_sp]
@@ -1702,5 +1784,166 @@ stub_trash:
     mov word [es:0], 0x4F45         ; 'E' white on red
     jmp $
 
+
+; ----- save_screen / restore_screen: the DOS text screen. It is video RAM, so
+;       it is not in the image; os8088 takes the card into a graphics mode and
+;       the BIOS mode set on the way back clears it. Page 0 of an 80-column
+;       text mode, up to 8,000 bytes (80x50). What is NOT kept: a loaded font,
+;       the palette, a split screen, other pages.
+save_screen:
+    push ds
+    push es
+    xor ax, ax
+    mov es, ax
+    mov al, [es:0x449]
+    mov bx, 0xB800
+    cmp al, 7
+    jne .c
+    mov bx, 0xB000
+.c: mov [cs:scr_seg], bx
+    mov ax, [es:0x44A]              ; columns
+    mov cl, [es:0x484]              ; rows - 1, 0 when there is no EGA data
+    test cl, cl
+    jnz .r
+    mov cl, 24
+.r: inc cl
+    xor ch, ch
+    mul cx
+    shl ax, 1
+    cmp ax, 8000
+    jbe .l
+    mov ax, 8000
+.l: and ax, 0xFFFE
+    mov [cs:scr_len], ax
+    mov cx, ax
+    shr cx, 1
+    mov ds, bx
+    xor si, si
+    push cs
+    pop es
+    mov di, blk_screen
+    cld
+    rep movsw
+    pop es
+    pop ds
+    ret
+
+restore_screen:                     ; after the image: the BDA is DOS's again
+    push ds
+    push es
+    xor ax, ax
+    mov es, ax
+    mov al, [es:0x449]
+    and al, 0x7F
+    xor ah, ah
+    int 0x10                        ; DOS's own INT 10h chain, restored with it
+    push cs
+    pop ds
+    mov ax, [scr_seg]
+    mov es, ax
+    xor di, di
+    mov si, blk_screen
+    mov cx, [scr_len]
+    shr cx, 1
+    cld
+    rep movsw
+    xor ax, ax
+    mov es, ax
+    mov dx, [es:0x450]              ; cursor, page 0: column in DL, row in DH
+    xor bx, bx
+    mov ah, 2
+    int 0x10
+    pop es
+    pop ds
+    ret
+
+; ----- stub_boot: what a BIOS does at int 19h, from a floppy -------------------
+;       Far-called by the launcher after the snapshot. It never returns: the
+;       way back is os8088's Restart, whose int 19h lands on stub_return.
+stub_boot:
+    cli
+    cld
+    mov ax, cs
+    mov ss, ax
+    mov sp, ST_STACK
+    mov ds, ax
+    xor ax, ax
+    mov es, ax
+    mov ax, [es:0x46C]
+    mov [blk_snap_tick], ax
+    call save_screen
+    ; the boot sector, to 0000:7C00, by the ROM's own INT 13h
+    mov bp, 3
+.try:
+    xor ax, ax
+    mov es, ax
+    mov bx, 0x7C00
+    mov ax, 0x0201
+    mov cx, 1
+    xor dh, dh
+    mov dl, [blk_bootunit]
+    call bios13
+    jnc .loaded
+    xor ax, ax
+    mov dl, [blk_bootunit]
+    call bios13
+    dec bp
+    jnz .try
+    mov byte [blk_bootfail], 1      ; no boot sector: give DOS back
+    call pic_set_quiet
+    mov word [blk_ret_tick], 0
+    jmp restore_all
+.loaded:
+    ; Restart will int 19h: that is the way back
+    xor ax, ax
+    mov es, ax
+    mov word [es:0x64], STUB_RETURN
+    mov [es:0x66], cs
+    ; the PIC as a BIOS leaves it, with DOS's own masks otherwise: the timer,
+    ; keyboard, cascade and floppy on, and on an AT the RTC and the hard disk
+    mov al, [sv_m1]
+    and al, 0xB8
+    out 0x21, al
+    cmp byte [at_flag], 0
+    je .xt
+    mov al, [sv_m2]
+    and al, 0xBE
+    and al, 0xBF
+    out 0xA1, al
+.xt:
+    mov dl, [blk_bootunit]
+    xor ax, ax
+    mov ds, ax
+    mov es, ax
+    xor bx, bx
+    xor cx, cx
+    xor dh, dh
+    xor si, si
+    xor di, di
+    xor bp, bp
+    mov ss, ax
+    mov sp, 0x7C00
+    sti
+    jmp 0x0000:0x7C00
+
+; ----- stub_return: int 19h from os8088's Restart ---------------------------------
+stub_return:
+    cli
+    cld
+    mov ax, cs
+    mov ss, ax
+    mov sp, ST_STACK
+    mov ds, ax
+    xor ax, ax
+    mov es, ax
+    mov ax, [es:0x46C]
+    mov [blk_ret_tick], ax
+    call pic_set_quiet              ; NOT pic_quiet: DOS's masks are already saved
+    jmp restore_all
+
 blk_runs    times (MAXRUNS * 6) db 0
 stub_end:
+blk_screen  equ stub_end            ; 8,000 bytes: runtime only, so no file bytes
+%if (stub_end - stub_start) + 8000 + 512 > HB_PARAS * 16
+ %error "the hidden block is too small for the stub, the extents and the screen"
+%endif

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""dosguest wave 1: DOS is suspended to a file and put back (docs/plans/DOSGUEST-PLAN.md).
+"""dosguest waves 1 and 2: DOS is suspended, os8088 runs, DOS comes back (docs/plans/DOSGUEST-PLAN.md).
 
     python3 tests/dosguest.py
 
@@ -33,12 +33,30 @@ one) - the snapshot is taken before either change.
 
 NEGATIVE CONTROLS: the host checker is run on a copy of the swap file with one
 byte of the pattern flipped and must refuse it.
+
+WAVE 2 is the same launcher with a drive letter, `DG B:`, and the real thing:
+the stub loads B:'s boot sector to 0000:7C00 and jumps to it with DL set, as a
+BIOS does at int 19h, so os8088's own stage 1 runs unchanged. Restart is its
+way home, because it ends in `int 19h` and the launcher has pointed that
+vector at the stub. What is asserted, with the guest running and then after:
+
+  * WHILE os8088 RUNS: its `mem_top` (read out of guest RAM at the address
+    tools/os88sym.py gives) is the HIDDEN size, not the machine's. That is the
+    whole of "os8088 cannot reach the block", read off os8088 itself;
+  * os8088 reached a desktop, and Restart (System menu, by the serial mouse)
+    took it out;
+  * AFTER: DOS is back. The pattern os8088 overwrote is intact, the IVT is
+    DOS's, the BIOS tick moved (os8088 ran), `dir` works, and the DOS text
+    screen from before the launcher is on the glass again - video RAM is not in
+    the image, so that one is the stub's own save and restore.
 """
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -78,6 +96,23 @@ def pattern_ok(swap, seg, paras):
 
 def sh(*a, **k):
     return subprocess.run(a, check=True, capture_output=True, **k)
+
+
+def read_result(data):
+    txt = subprocess.run(["mtype", "-i", data, "::DGRESULT.TXT"], capture_output=True)
+    if txt.returncode:
+        return None
+    res = {"runs": []}
+    for line in txt.stdout.decode("latin1").splitlines():
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        if k == "run":
+            lba, n = v.split()
+            res["runs"].append((int(lba, 16), int(n, 16)))
+        else:
+            res[k] = v
+    return res
 
 
 def run_guest(work, ram_mb, defs=(), secs=120):
@@ -131,6 +166,126 @@ def run_guest(work, ram_mb, defs=(), secs=120):
         else:
             res[k] = v
     return res, data
+
+
+def hmp(sock, *cmds):
+    r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "qmp.py"), sock, *cmds],
+                       capture_output=True, text=True, cwd=ROOT)
+    return r.stdout
+
+
+def sym(*names):
+    out = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "os88sym.py"), *names],
+                         capture_output=True, text=True, cwd=ROOT, check=True).stdout
+    res = {}
+    for line in out.strip().splitlines():
+        f = line.split()
+        if len(f) >= 4:
+            res[f[0]] = int(f[3], 16)
+    return res
+
+
+def peek16(sock, lin):
+    out = hmp(sock, "xp /1xh 0x%x" % lin)
+    for line in out.splitlines():
+        if ":" in line and "0x" in line.split(":", 1)[1]:
+            return int(line.split(":", 1)[1].split()[0], 16)
+    return None
+
+
+def text_screen(sock, base=0xB8000, cols=80, rows=25):
+    """The text screen as a list of strings, read out of video RAM."""
+    out = hmp(sock, "xp /%dxb 0x%x" % (cols * rows * 2, base))
+    b = bytearray()
+    for line in out.splitlines():
+        if ":" in line:
+            b += bytes(int(x, 16) for x in line.split(":", 1)[1].split() if x.startswith("0x"))
+    chars = b[0::2]
+    return [bytes(chars[r * cols:(r + 1) * cols]).decode("latin1").rstrip() for r in range(rows)]
+
+
+def run_boot(work, os_img):
+    """Wave 2: `DG B:` with os8088 in B:, Restart by the mouse, DOS back."""
+    com = os.path.join(work, "DG.COM")
+    sh("nasm", "-w+error", "-f", "bin", "-o", com, os.path.join(ROOT, "dosguest", "dg.asm"))
+    boot = os.path.join(work, "boot.img")
+    shutil.copy(getfreedos.IMG, boot)
+    osd = os.path.join(work, "os8088.img")
+    shutil.copy(os_img, osd)
+    cfg, auto = os.path.join(work, "cfg"), os.path.join(work, "auto")
+    with open(cfg, "wb") as f:
+        f.write(b"SHELL=\\FREEDOS\\BIN\\COMMAND.COM \\FREEDOS\\BIN /E:2048 /P=\\FDAUTO.BAT\r\n")
+    # no poweroff: the harness reads the screen first. `dir` and `ver` after the
+    # launcher prove DOS's file layer and its own state came back, not only RAM
+    with open(auto, "wb") as f:
+        f.write(b"@echo off\r\nc:\r\ndg /k b: > c:\\log.txt\r\n"
+                b"dir c:\\ > c:\\after.txt\r\nver >> c:\\after.txt\r\n"
+                b"echo DOSGUEST-BACK\r\n")
+    sh("mcopy", "-o", "-i", boot, cfg, "::FDCONFIG.SYS")
+    sh("mcopy", "-o", "-i", boot, auto, "::FDAUTO.BAT")
+    data = os.path.join(work, "data.img")
+    sh("mformat", "-C", "-T", "16384", "-h", "16", "-s", "63", "-i", data, "::")
+    sh("mcopy", "-o", "-i", data, com, "::DG.COM")
+    sock = os.path.join(work, "q.sock")
+    q = subprocess.Popen(
+        ["qemu-system-i386", "-display", "none", "-no-reboot", "-m", "8",
+         "-drive", "file=%s,format=raw,if=floppy,index=0" % boot,
+         "-drive", "file=%s,format=raw,if=floppy,index=1" % osd,
+         "-drive", "file=%s,format=raw,if=ide" % data, "-boot", "a",
+         "-chardev", "msmouse,id=m0", "-serial", "chardev:m0",
+         "-qmp", "unix:%s,server,nowait" % sock],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    info = {}
+    try:
+        syms = sym("mem_top", "ticks")
+        t0 = time.time()
+        # os8088 is up when its mem_top is a plausible machine and a desktop is drawn
+        while time.time() - t0 < 120:
+            time.sleep(2)
+            if not os.path.exists(sock):
+                continue
+            mt = peek16(sock, syms["mem_top"])
+            if mt and 0x8000 <= mt <= 0xA000:
+                shot = os.path.join(work, "desk.png")
+                m = re.search(r"(\d+(?:\.\d+)?)% non-white",
+                              subprocess.run([sys.executable, os.path.join(ROOT, "tools", "shot.py"),
+                                              sock, shot], capture_output=True, text=True,
+                                             cwd=ROOT).stdout)
+                if m and float(m.group(1)) > 30:
+                    info["mem_top"] = mt
+                    break
+        check("mem_top" in info, "os8088 reached a desktop under DOS (mem_top %s)"
+              % (hex(info["mem_top"]) if "mem_top" in info else "never read"))
+        if "mem_top" not in info:
+            return None, data, info
+        tk = peek16(sock, syms["ticks"])
+        time.sleep(3)
+        tk2 = peek16(sock, syms["ticks"])
+        check(tk is not None and tk2 is not None and tk != tk2,
+              "os8088's own tick count is advancing (%s -> %s)" % (tk, tk2))
+        # Restart: the System menu, then its item. Coordinates are the 640x480
+        # VGA desktop's (a screenshot of the open menu put Restart at 30,108)
+        mouse = [sys.executable, os.path.join(ROOT, "tools", "mouse.py"), "--screen", "640x480", sock]
+        subprocess.run(mouse + ["down", "15", "9"], check=True, cwd=ROOT, capture_output=True)
+        time.sleep(1)
+        subprocess.run(mouse + ["to", "30", "108"], check=True, cwd=ROOT, capture_output=True)
+        subprocess.run(mouse + ["up"], check=True, cwd=ROOT, capture_output=True)
+        back = False
+        for _ in range(40):
+            time.sleep(2)
+            scr = text_screen(sock)
+            if any("DOSGUEST-BACK" in ln for ln in scr):
+                back = True
+                break
+        info["screen"] = text_screen(sock)
+        check(back, "Restart took os8088 out and DOS ran on (DOSGUEST-BACK on the screen)")
+    finally:
+        q.terminate()
+        try:
+            q.wait(10)
+        except subprocess.TimeoutExpired:
+            q.kill()
+    return back, data, info
 
 
 def main():
@@ -187,6 +342,49 @@ def main():
               "NEGATIVE: one flipped bit in the pattern is refused")
         check(not pattern_ok(swap, seg + 1, paras),
               "NEGATIVE: the pattern is not accepted at the wrong offset")
+
+        # --- WAVE 2: os8088 itself ------------------------------------------
+        os_img = os.path.join(ROOT, "build", "os8088.img")
+        if not os.path.exists(os_img):
+            print("  SKIP wave 2: no build/os8088.img (make)")
+        else:
+            print("wave 2: DG B: with os8088 in B:")
+            w3 = tempfile.mkdtemp(prefix="dosguest-boot-")
+            try:
+                back, data2, info = run_boot(w3, os_img)
+                r2 = read_result(data2) if back else None
+                check(r2 is not None, "DG wrote its result after os8088 returned")
+                if r2 is not None:
+                    g = lambda k: int(r2[k], 16)
+                    print("  guest: %s" % {k: v for k, v in r2.items() if k != "runs"})
+                    check(r2.get("resumed") == "1" and g("bootmode") == 1, "DG resumed, in boot mode")
+                    check(g("bootfail") == 0, "the boot sector loaded")
+                    check(info["mem_top"] == g("size_kb") * 64,
+                          "os8088 sized itself to the HIDDEN machine: mem_top %04X == %d KB * 64"
+                          % (info["mem_top"], g("size_kb")))
+                    check(((g("tick_at_return") - g("tick_at_boot")) & 0xFFFF) > 36,
+                          "os8088 ran: the BIOS tick moved %d ticks"
+                          % ((g("tick_at_return") - g("tick_at_boot")) & 0xFFFF))
+                    check(g("mismatches") == 0,
+                          "the pattern os8088 overwrote came back (0 mismatches over %d KB)"
+                          % (g("pattern_paras") * 16 // 1024))
+                    check(g("ivt_mismatches") == 0, "DOS's vectors came back (IVT)")
+                    check(g("int12_after") == g("orig_kb"), "int 12h is the original size again")
+                    scr = info["screen"]
+                    check(any("FreeCom version" in ln for ln in scr),
+                          "the DOS screen from BEFORE the launcher is back (FreeCom banner)")
+                    after = subprocess.run(["mtype", "-i", data2, "::AFTER.TXT"], capture_output=True)
+                    atxt = after.stdout.decode("latin1")
+                    check("DG" in atxt and "DGSWAP" in atxt and "FreeCom" in atxt,
+                          "DOS's file layer works after the resume (dir and ver ran)")
+                    # the swap file is os8088-time evidence too: it must hold the pattern
+                    img2 = open(data2, "rb").read()
+                    v2 = dgfat.Volume(img2)
+                    swap2 = v2.read(b"DGSWAP  IMG")
+                    check(pattern_ok(swap2, g("pattern_seg"), g("pattern_paras")),
+                          "the swap file holds the pattern (read off the disk after os8088 ran)")
+            finally:
+                shutil.rmtree(w3, ignore_errors=True)
 
         # THE GUEST'S OWN NEGATIVE CONTROL: the same launcher with the restore
         # left out. The trash then wipes the launcher itself, so the honest
