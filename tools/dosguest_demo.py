@@ -3,6 +3,8 @@
 
     python3 tools/dosguest_demo.py                 # build build/dosguest-demo/
     python3 tools/dosguest_demo.py --serve [PORT]  # ...and serve it (default 8087)
+    python3 tools/dosguest_demo.py --qemu          # ...and open it in a QEMU window
+    python3 tools/dosguest_demo.py --qemu --display none   # (headless; what the check uses)
 
 FreeDOS boots in v86 and leaves you at its prompt. Type
 
@@ -83,6 +85,35 @@ window.onload = function() {
 """
 
 
+def qemu_args(display="gtk", qmp=None):
+    """QEMU on the demo's disks. os8088 here is the STANDARD kernel (build/os8088.img) with
+    QEMU's serial mouse - the pair every test in tests/dosguest.py drives - not the emu
+    kernel's absolute pointer, which is what v86 is for. The serial mouse is RELATIVE: click
+    the window to GRAB it (Ctrl+Alt+G lets go)."""
+    std = os.path.join(ROOT, "build", "os8088.img")
+    if not os.path.exists(std):
+        sys.exit("dosguest_demo: no build/os8088.img - run make")
+    shutil.copy(std, os.path.join(OUT, "os8088-std.img"))
+    a = ["qemu-system-i386", "-m", "8", "-boot", "a", "-display", display, "-no-reboot",
+         "-drive", "file=%s,format=raw,if=floppy,index=0" % os.path.join(OUT, "boot.img"),
+         "-drive", "file=%s,format=raw,if=floppy,index=1" % os.path.join(OUT, "os8088-std.img"),
+         "-drive", "file=%s,format=raw,if=ide" % os.path.join(OUT, "hda.img"),
+         "-chardev", "msmouse,id=m0", "-serial", "chardev:m0"]
+    if qmp:
+        a += ["-qmp", "unix:%s,server,nowait" % qmp]
+    return a
+
+
+def run_qemu():
+    disp = "gtk"
+    if "--display" in sys.argv:
+        disp = sys.argv[sys.argv.index("--display") + 1]
+    print("dosguest_demo: QEMU. At the FreeDOS prompt type  DG B:  and Enter.")
+    print("dosguest_demo: click the window to grab the mouse (Ctrl+Alt+G releases it);")
+    print("dosguest_demo: in os8088, System menu (the logo, top left) > Restart returns to DOS.")
+    os.execvp("qemu-system-i386", qemu_args(disp))
+
+
 def main():
     emu = os.path.join(ROOT, "build", "emu.img")
     for need, how in ((emu, "make emu"), (getfreedos.IMG, "python3 tools/getfreedos.py"),
@@ -119,6 +150,8 @@ def main():
     with open(os.path.join(OUT, "index.html"), "w") as f:
         f.write(HTML)
     print("dosguest_demo: %s" % OUT)
+    if "--qemu" in sys.argv:
+        return run_qemu()
     if "--serve" in sys.argv:
         i = sys.argv.index("--serve")
         port = int(sys.argv[i + 1]) if len(sys.argv) > i + 1 and sys.argv[i + 1].isdigit() else 8087
