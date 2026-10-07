@@ -50,6 +50,7 @@ vector at the stub. What is asserted, with the guest running and then after:
     screen from before the launcher is on the glass again - video RAM is not in
     the image, so that one is the stub's own save and restore.
 """
+import hashlib
 import os
 import re
 import shutil
@@ -281,7 +282,7 @@ def text_screen(sock, cols=80, rows=50):
     return lines
 
 
-def run_boot(work, os_img, auto_lines=None, files=(), cfg_extra=(), during=None):
+def run_boot(work, os_img, auto_lines=None, files=(), cfg_extra=(), during=None, hd2=None):
     """Wave 2: `DG B:` with os8088 in B:, Restart by the mouse, DOS back."""
     com = os.path.join(work, "DG.COM")
     sh("nasm", "-w+error", "-f", "bin", "-o", com, os.path.join(ROOT, "dosguest", "dg.asm"))
@@ -303,7 +304,9 @@ def run_boot(work, os_img, auto_lines=None, files=(), cfg_extra=(), during=None)
         ["qemu-system-i386", "-display", "none", "-no-reboot", "-m", "8",
          "-drive", "file=%s,format=raw,if=floppy,index=0" % boot,
          "-drive", "file=%s,format=raw,if=floppy,index=1" % osd,
-         "-drive", "file=%s,format=raw,if=ide" % data, "-boot", "a",
+         "-drive", "file=%s,format=raw,if=ide,index=0" % data]
+        + (["-drive", "file=%s,format=raw,if=ide,index=1" % hd2] if hd2 else []) +
+        ["-boot", "a",
          "-chardev", "msmouse,id=m0", "-serial", "chardev:m0",
          "-qmp", "unix:%s,server,nowait" % sock],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -595,6 +598,36 @@ def scenarios(host):
                     shutil.rmtree(wd, ignore_errors=True)
         finally:
             shutil.rmtree(tw, ignore_errors=True)
+
+        # --- os8088 installed on a HARD DISK ----------------------------------
+        # An os8088 hard-disk install is booted through its volume boot record
+        # (boot/boothd.asm), which takes DL and its own BPB. DOS calls the volume
+        # D:, so the launcher finds its BIOS unit and partition start by content.
+        # And the disk is handed to os8088 write-protected, so the image must be
+        # byte-for-byte unchanged afterwards.
+        need = [os.path.join(ROOT, "build", f) for f in ("kernel.sys", "boothd.bin", "mbr.bin")]
+        if all(os.path.exists(n) for n in need) and os.path.exists(os_img):
+            hw = tempfile.mkdtemp(prefix="dosguest-hd-")
+            try:
+                hdimg = os.path.join(hw, "os8088hd.img")
+                sh(sys.executable, os.path.join(ROOT, "tools", "os88hdd.py"), "--raw", "--spt", "63",
+                   "--heads", "16", "--cyls", "65", "--kernel", need[0], "--vbr", need[1], "--mbr", need[2],
+                   "--out", hdimg)
+                before = hashlib.sha256(open(hdimg, "rb").read()).hexdigest()
+                print("os8088 on a hard disk: DG D: (a second IDE disk, DOS's D:)")
+                back, d, info = run_boot(hw, os_img, auto_lines=[b"dg /k d: > c:\\log.txt"], hd2=hdimg)
+                rh = read_result(d) if back else None
+                check(rh is not None and rh.get("resumed") == "1" and int(rh["bootfail"], 16) == 0,
+                      "DG found D:, booted os8088 from its volume boot record, and DOS came back")
+                if rh is not None:
+                    check(int(rh["boot_unit"], 16) == 0x81 and int(rh["tick_at_return"], 16) != int(rh["tick_at_boot"], 16),
+                          "os8088 ran from BIOS unit %s" % rh["boot_unit"])
+                    check(int(rh["mismatches"], 16) == 0 and int(rh["ivt_mismatches"], 16) == 0,
+                          "memory and the IVT came back")
+                after = hashlib.sha256(open(hdimg, "rb").read()).hexdigest()
+                check(after == before, "the os8088 disk is byte-for-byte unchanged: os8088 could not write it")
+            finally:
+                shutil.rmtree(hw, ignore_errors=True)
 
         # --- a disk the old addressing cannot reach ----------------------------
         # A partition that starts 8 GB into a 10 GB disk: past the 1,024th cylinder,

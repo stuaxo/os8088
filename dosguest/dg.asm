@@ -87,6 +87,10 @@ tmp_m       db 0
 tmp_s       db 0
 bootmode    db 0                    ; 1 = boot os8088 from bootunit
 bootunit    db 0
+bootdrive   db 0                    ; the DOS drive letter, 0 = A
+boothd      db 0                    ; 1: a hard-disk volume
+bootlba     dw 0, 0                 ; its first sector, absolute: the volume's hidden sectors
+swap_unit   db 0
 bad         dw 0                    ; pattern mismatches after the resume
 fatsec      dw 0xFFFF               ; the FAT sector in secbuf, if any
 fatsec_ok   db 0
@@ -118,7 +122,8 @@ swapname    db '\DGSWAP.IMG', 0
 resname     db '\DGRESULT.TXT', 0
 dirname     db 'DGSWAP  IMG'
 
-msg_boot    db 'DG: wave 2 boots os8088 from a floppy only: DG A: or DG B:', 13, 10, '$'
+msg_boot    db 'DG: the drive to boot os8088 from is a letter A: to Z:', 13, 10, '$'
+msg_loc     db 'DG: cannot find that drive on the BIOS (is it a hard-disk volume DOS owns?)', 13, 10, '$'
 msg_v86     db 'DG: the CPU is in protected or virtual-8086 mode (EMM386, JEMM, QEMM, Windows)', 13, 10
             db '    os8088 needs the real machine. Boot without the memory manager.', 13, 10, '$'
 msg_dos     db 'DG: needs DOS 3.0 or later', 13, 10, '$'
@@ -169,16 +174,23 @@ main:
     je .sw
     cmp al, ' '
     je .cl
-    ; a letter and a colon: the drive os8088 is to boot from. FLOPPY ONLY in
-    ; wave 2 (A: or B:): a hard disk's boot is boot/boothd.asm behind an MBR.
+    ; a letter and a colon: the DOS drive os8088 is to boot from. A: and B: are
+    ; the floppies (BIOS units 0 and 1); a higher letter is a hard-disk volume, whose
+    ; BIOS unit and partition start are found by locate_boot once the stub exists.
     mov ah, al
     and ah, 0xDF
     cmp byte [si], ':'
     jne .cl
     sub ah, 'A'
-    cmp ah, 1
+    cmp ah, 25
     ja .badboot
+    mov [bootdrive], ah
     mov [bootunit], ah
+    cmp ah, 2
+    jb .flop
+    mov byte [boothd], 1
+    mov byte [bootunit], 0x80       ; until locate_boot says which
+.flop:
     mov byte [bootmode], 1
     inc si
     jmp .cl
@@ -335,6 +347,10 @@ main:
     MARK 'g'
     call build_runs
     MARK 'h'
+    cmp byte [boothd], 0
+    je .nolocate
+    call locate_boot                ; a hard-disk os8088: which unit, which sector
+.nolocate:
     ; --- state the stub needs that is not in the image ----------------------
     MARK 'i'
     ; --- THE SNAPSHOT: a second return from this call is the resume ----------
@@ -850,7 +866,10 @@ save_vectors:
     test al, al
     jnz .wm
     mov cl, [bootunit]              ; a bare /W: the unit os8088 booted from
-    mov al, 1
+    mov al, 0x80                    ; a hard disk: bit 7...
+    cmp cl, 0x80
+    jae .wm
+    mov al, 1                       ; ...a floppy: its own bit
     shl al, cl
 .wm:
     mov [es:blk_wmask], al
@@ -1416,6 +1435,108 @@ set_unit:
     ret
 
 ; =============================================================================
+; locate_boot: the os8088 volume is a hard-disk volume DOS calls [bootdrive]. Its
+; boot sector, read through DOS, says where the volume starts (the BPB's hidden
+; sectors) and is then looked for on each BIOS unit by content, as find_unit does
+; for the swap volume, so that the unit is what the BIOS calls it and not a guess.
+; The unit's geometry and EDD flag are kept in the block for stub_boot, and the
+; swap volume's are put back.
+; =============================================================================
+read_lba:                           ; DX:AX = an ABSOLUTE LBA, CX = count -> secbuf
+    mov bx, [secbuf]
+    push es
+    push cs
+    pop es
+    mov di, 2
+    call disk
+    pop es
+    ret
+
+locate_boot:
+    push es
+    mov es, [hseg]
+    mov al, [es:blk_unit]
+    mov [swap_unit], al
+    push cs
+    pop es
+    xor ax, ax
+    mov [pk_sec], ax
+    mov [pk_sec+2], ax
+    mov word [pk_cnt], 1
+    mov ax, [secbuf]
+    mov [pk_off], ax
+    mov [pk_seg], cs
+    mov al, [bootdrive]
+    cmp byte [dos_classic], 0
+    jne .cls
+    mov cx, 0xFFFF
+    mov bx, pk_sec
+    int 0x25
+    pop ax
+    jc .bad
+    jmp .got
+.cls:
+    mov cx, 1
+    xor dx, dx
+    mov bx, [secbuf]
+    int 0x25
+    pop ax
+    jc .bad
+.got:
+    mov si, [secbuf]
+    mov di, bootsave2
+    mov cx, 256
+    rep movsw
+    mov ax, [bootsave2+0x1C]
+    mov [bootlba], ax
+    mov ax, [bootsave2+0x1E]
+    mov [bootlba+2], ax
+    mov al, 0x80
+.try:
+    push ax
+    call set_unit
+    jc .next
+    mov ax, [bootlba]
+    mov dx, [bootlba+2]
+    mov cx, 1
+    call read_lba
+    jc .next
+    mov si, [secbuf]
+    mov di, bootsave2
+    mov cx, 256
+    repe cmpsw
+    jne .next
+    pop ax
+    mov [bootunit], al
+    mov es, [hseg]
+    mov [es:blk_bootunit], al
+    mov ax, [bootlba]
+    mov [es:blk_bootlba], ax
+    mov ax, [bootlba+2]
+    mov [es:blk_bootlba+2], ax
+    mov al, [es:blk_unit]           ; set_unit has just filled these for the boot unit
+    mov [es:blk_b_unit], al
+    mov ax, [es:blk_spt]
+    mov [es:blk_b_spt], ax
+    mov ax, [es:blk_heads]
+    mov [es:blk_b_heads], ax
+    mov al, [es:blk_edd]
+    mov [es:blk_b_edd], al
+    mov al, [swap_unit]             ; and the swap volume's back, which the image uses
+    call set_unit
+    pop es
+    ret
+.next:
+    pop ax
+    inc al
+    cmp al, 0x88
+    jb .try
+.bad:
+    mov dx, msg_loc
+    jmp fail
+bootsave2 times 512 db 0
+
+; =============================================================================
 ; find_file / build_runs: the swap file's cluster chain, as extents
 ; =============================================================================
 find_file:
@@ -1763,6 +1884,11 @@ report:                             ; ES = the block
     mov ax, [es:blk_ret_tick]
     call emit_hex16
     call emit_crlf
+    mov si, r_bunit
+    call emit_str
+    mov al, [bootunit]
+    call emit_hex8
+    call emit_crlf
     mov si, r_edd
     call emit_str
     mov al, [es:blk_edd]
@@ -1881,6 +2007,7 @@ r_a20    db 'a20_dos_boot_final=', 0
 r_filter db 'int15_filter=', 0
 r_wtest  db 'wtest_ah_cf_wmask=', 0
 r_edd    db 'edd=', 0
+r_bunit  db 'boot_unit=', 0
 r_hid    db 'hidden_sectors=', 0
 r_tsnap  db 'dos_secs_snap=', 0
 r_taft   db 'dos_secs_after=', 0
@@ -2000,6 +2127,11 @@ blk_bounce  dw 0
 at_flag     db 0
 blk_err     dw 0
 blk_bootunit db 0
+blk_bootlba dw 0, 0
+blk_b_unit  db 0
+blk_b_edd   db 0
+blk_b_spt   dw 0
+blk_b_heads dw 0
 blk_bootmode db 0
 blk_bootfail db 0
 blk_pad2    db 0
@@ -3130,6 +3262,8 @@ stub_boot:
     call a20_set                    ; written for it off (an XMS driver may have left it so)
     call a20_test
     mov [blk_a20_boot], al
+    cmp byte [blk_bootunit], 0x80
+    jae .hdboot
     ; the boot sector, to 0000:7C00, by the ROM's own INT 13h
     mov bp, 3
 .try:
@@ -3148,6 +3282,43 @@ stub_boot:
     dec bp
     jnz .try
     mov byte [blk_bootfail], 1      ; no boot sector: give DOS back
+    call pic_set_quiet
+    mov word [blk_ret_tick], 0
+    jmp restore_all
+.hdboot:
+    ; A HARD-DISK VOLUME: its boot record is the partition's first sector, which
+    ; boot/boothd.asm takes DL and its own BPB for. The stub's disk service works
+    ; on the swap volume's unit and geometry, so swap them for the one read.
+    push word [blk_unit]            ; (a byte and its pad)
+    push word [blk_spt]
+    push word [blk_heads]
+    push word [blk_edd]
+    mov al, [blk_b_unit]
+    mov [blk_unit], al
+    mov ax, [blk_b_spt]
+    mov [blk_spt], ax
+    mov ax, [blk_b_heads]
+    mov [blk_heads], ax
+    mov al, [blk_b_edd]
+    mov [blk_edd], al
+    mov word [blk_op], 2
+    xor ax, ax
+    mov es, ax
+    mov bx, 0x7C00
+    mov ax, [blk_bootlba]
+    mov dx, [blk_bootlba+2]
+    mov cx, 1
+    push cs
+    call stub_rw
+    pushf
+    pop si                          ; keep the carry across the pops
+    pop word [blk_edd]
+    pop word [blk_heads]
+    pop word [blk_spt]
+    pop word [blk_unit]
+    test si, 1
+    jz .loaded
+    mov byte [blk_bootfail], 1
     call pic_set_quiet
     mov word [blk_ret_tick], 0
     jmp restore_all
