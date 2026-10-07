@@ -81,7 +81,7 @@ def pattern_bytes(paras):
     return bytes(out)
 
 
-def pattern_ok(swap, seg, paras):
+def pattern_ok(swap, seg, paras, image_bytes):
     """Does the swap file hold the pattern where the guest says it filled?
 
     Only the part INSIDE the image: the image is rounded down to 16KB, so the
@@ -90,7 +90,7 @@ def pattern_ok(swap, seg, paras):
     is why the guest's own verify passes over it and this must not look.
     """
     o = seg * 16
-    n = min(paras * 16, len(swap) - o)
+    n = min(paras * 16, image_bytes - o)
     return n > 0 and swap[o:o + n] == pattern_bytes(paras)[:n]
 
 
@@ -222,9 +222,9 @@ def peek16(sock, lin):
     return None
 
 
-def text_screen(sock, base=0xB8000, cols=80, rows=25):
+def text_screen(sock, base=0xB8000, cols=80, rows=50):
     """The text screen as a list of strings, read out of video RAM."""
-    out = hmp(sock, "xp /%dxb 0x%x" % (cols * rows * 2, base))
+    out = hmp(sock, "xp /%dxb 0x%x" % (cols * rows * 2, base))   # 80x50 is the most a host is in
     b = bytearray()
     for line in out.splitlines():
         if ":" in line:
@@ -359,10 +359,11 @@ def main():
         vol = dgfat.Volume(img)
         runs, size = vol.extents(b"DGSWAP  IMG")
         check(runs == res["runs"], "dgfat.py finds the guest's extents %s" % (runs,))
-        check(size == h("size_kb") * 1024, "the swap file is the image's size (%d)" % size)
+        check(size == h("size_kb") * 1024 + 32768,
+              "the swap file is the image plus the 32 KB video area (%d)" % size)
         swap = vol.read(b"DGSWAP  IMG")
         seg, paras = h("pattern_seg"), h("pattern_paras")
-        check(pattern_ok(swap, seg, paras),
+        check(pattern_ok(swap, seg, paras, h("size_kb") * 1024),
               "the swap file holds the pattern at %04X:0, %d paragraphs" % (seg, paras))
         bda = int.from_bytes(swap[0x413:0x415], "little")
         check(bda == h("orig_kb"),
@@ -376,9 +377,9 @@ def main():
         # --- negative controls ---------------------------------------------
         bad = bytearray(swap)
         bad[seg * 16 + 1000] ^= 0x01
-        check(not pattern_ok(bytes(bad), seg, paras),
+        check(not pattern_ok(bytes(bad), seg, paras, h("size_kb") * 1024),
               "NEGATIVE: one flipped bit in the pattern is refused")
-        check(not pattern_ok(swap, seg + 1, paras),
+        check(not pattern_ok(swap, seg + 1, paras, h("size_kb") * 1024),
               "NEGATIVE: the pattern is not accepted at the wrong offset")
 
         # --- WAVE 2: os8088 itself ------------------------------------------
@@ -403,6 +404,11 @@ def main():
                     check(((g("tick_at_return") - g("tick_at_boot")) & 0xFFFF) > 36,
                           "os8088 ran: the BIOS tick moved %d ticks"
                           % ((g("tick_at_return") - g("tick_at_boot")) & 0xFFFF))
+                    ran = ((g("tick_at_return") - g("tick_at_boot")) & 0xFFFF) / 18.2065
+                    dsec = g("dos_secs_after") - g("dos_secs_snap")
+                    check(ran - 2 <= dsec <= ran + 30,
+                          "DOS's clock moved on by the time os8088 ran: %d s against %.1f s of ticks"
+                          % (dsec, ran))
                     check(g("mismatches") == 0,
                           "the pattern os8088 overwrote came back (0 mismatches over %d KB)"
                           % (g("pattern_paras") * 16 // 1024))
@@ -419,10 +425,55 @@ def main():
                     img2 = open(data2, "rb").read()
                     v2 = dgfat.Volume(img2)
                     swap2 = v2.read(b"DGSWAP  IMG")
-                    check(pattern_ok(swap2, g("pattern_seg"), g("pattern_paras")),
+                    check(pattern_ok(swap2, g("pattern_seg"), g("pattern_paras"), g("size_kb") * 1024),
                           "the swap file holds the pattern (read off the disk after os8088 ran)")
             finally:
                 shutil.rmtree(w3, ignore_errors=True)
+
+        # --- video: the DOS text state, brought back --------------------------
+        if os.path.exists(os_img):
+            vw = tempfile.mkdtemp(prefix="dosguest-vid-")
+            try:
+                progs = {}
+                for name, src, defs in (("vidset", "vidset.asm", ()), ("vidgfx", "vidset.asm", ("-DGFX",)),
+                                        ("vidq", "vidq.asm", ())):
+                    out = os.path.join(vw, name + ".com")
+                    sh("nasm", "-w+error", *defs, "-f", "bin", "-o", out,
+                       os.path.join(ROOT, "tests", "dgtsr", src))
+                    progs[name] = out
+                print("video: 80x50, a custom font, a palette entry, the cursor, text on row 40")
+                wd = tempfile.mkdtemp(prefix="dosguest-v1-")
+                try:
+                    back, d, info = run_boot(
+                        wd, os_img,
+                        auto_lines=[b"vidq > c:\\v0.txt", b"vidset", b"vidq > c:\\v1.txt",
+                                    b"dg /k b: > c:\\log.txt", b"vidq > c:\\v2.txt"],
+                        files=[progs["vidset"], progs["vidq"]])
+                    v = {k: subprocess.run(["mtype", "-i", d, "::%s.TXT" % k.upper()],
+                                           capture_output=True).stdout.decode().strip()
+                         for k in ("v0", "v1", "v2")}
+                    print("  default : %s\n  set up  : %s\n  after   : %s" % (v["v0"], v["v1"], v["v2"]))
+                    check(v["v1"] != v["v0"] and v["v1"].startswith("03 31 08"),
+                          "CONTROL: vidset really changed the state (80x50, 8-line font, a custom glyph)")
+                    check(v["v2"] == v["v1"] and v["v2"] != "",
+                          "after os8088 and Restart the video state is IDENTICAL: mode, rows, "
+                          "font height, cursor, palette, the custom glyph, the row-40 text")
+                finally:
+                    shutil.rmtree(wd, ignore_errors=True)
+                print("video: a host in a graphics mode comes back in text")
+                wd = tempfile.mkdtemp(prefix="dosguest-v2-")
+                try:
+                    back, d, info = run_boot(
+                        wd, os_img,
+                        auto_lines=[b"vidgfx", b"dg /k b: > c:\\log.txt", b"vidq > c:\\v3.txt"],
+                        files=[progs["vidgfx"], progs["vidq"]])
+                    v3 = subprocess.run(["mtype", "-i", d, "::V3.TXT"], capture_output=True).stdout.decode().strip()
+                    print("  after   : %s" % v3)
+                    check(v3.startswith("03 "), "a graphics-mode host comes back in 80x25 text (mode 03)")
+                finally:
+                    shutil.rmtree(wd, ignore_errors=True)
+            finally:
+                shutil.rmtree(vw, ignore_errors=True)
 
         # --- TSRs ---------------------------------------------------------
         built = {}

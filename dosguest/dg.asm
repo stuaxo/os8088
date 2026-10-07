@@ -37,9 +37,12 @@ bits 16
 org 0x100
 
 PAT_SEED    equ 0x1234              ; tests/dosguest.py regenerates the pattern from it
-HB_PARAS    equ 0x300               ; the hidden block: 12KB (stub, extents, the DOS screen)
+HB_PARAS    equ 0x200               ; the hidden block: 8KB (stub, extents, a 1KB bounce)
+VIDEO_KB    equ 32                  ; the swap file's video area, after the image
+VIDEO_SECS  equ VIDEO_KB * 2
 MAXRUNS     equ 128                 ; extents; 6 bytes each
-ST_STACK    equ 0x2FF0              ; the stub's stack top, inside the block
+ST_STACK    equ 0x1FF0              ; the stub's stack top, inside the block
+ST_STACK_USE equ 512                ; what it may use below that
 SECBUF_LEN  equ 1024                ; FAT/dir/boot sector buffer (2 sectors)
 
 %macro MARK 1
@@ -66,6 +69,11 @@ pseg        dw 0                    ; the pattern block
 pparas      dw 0
 drive       db 0                    ; 0 = A
 keep        db 0
+t_snap      dw 0, 0                 ; seconds of the day at the snapshot, and after
+t_after     dw 0, 0
+tmp_h       db 0
+tmp_m       db 0
+tmp_s       db 0
 bootmode    db 0                    ; 1 = boot os8088 from bootunit
 bootunit    db 0
 bad         dw 0                    ; pattern mismatches after the resume
@@ -238,6 +246,9 @@ main:
     ; --- state the stub needs that is not in the image ----------------------
     MARK 'i'
     ; --- THE SNAPSHOT: a second return from this call is the resume ----------
+    call dos_secs
+    mov [t_snap], ax
+    mov [t_snap+2], dx
     push bp
     push si
     push di
@@ -265,6 +276,10 @@ main:
 
 resumed:
     MARK 'R'
+    call fix_clock
+    call dos_secs
+    mov [t_after], ax
+    mov [t_after+2], dx
     ; DS=CS again by the stub's restore. Everything here is the snapshot's.
     mov al, 1
     call pattern
@@ -514,6 +529,20 @@ install_stub:
     mov [es:blk_nruns], ax
     mov ax, [hseg]
     mov [es:blk_seg], ax
+    mov ax, [size_kb]
+    shl ax, 1
+    mov [es:blk_img_secs], ax       ; the image is this many sectors of the file
+    ; the bounce buffer for the video area has to be 512-aligned PHYSICALLY (the
+    ; stub's disk service refuses otherwise), and the block is only paragraph
+    ; aligned: offset = stub_end + whatever reaches the next 512
+    mov ax, [hseg]
+    mov cl, 4
+    shl ax, cl
+    add ax, stub_end
+    neg ax
+    and ax, 511
+    add ax, stub_end
+    mov [es:blk_bounce], ax
     mov al, [bootunit]
     mov [es:blk_bootunit], al
     mov al, [bootmode]
@@ -580,6 +609,106 @@ save_vectors:
     add si, bx                      ; * 3
     shl si, 1                       ; * 6
     add si, cleanlist
+    ret
+
+; =============================================================================
+; dos_secs: DOS's clock as seconds since midnight, DX:AX
+; =============================================================================
+dos_secs:
+    mov ah, 0x2C
+    int 0x21                        ; CH hours, CL minutes, DH seconds
+    mov [tmp_h], ch
+    mov [tmp_m], cl
+    mov [tmp_s], dh
+    mov al, [tmp_h]
+    xor ah, ah
+    mov cx, 3600
+    mul cx                          ; DX:AX
+    push dx
+    push ax
+    mov al, [tmp_m]
+    xor ah, ah
+    mov cx, 60
+    mul cx
+    pop bx
+    add ax, bx
+    pop bx
+    adc dx, bx
+    mov bl, [tmp_s]
+    xor bh, bh
+    add ax, bx
+    adc dx, 0
+    ret
+
+; =============================================================================
+; fix_clock: DOS's time is the BIOS tick count at the snapshot, and that stopped
+; while os8088 ran. The RTC did not. Read it, set DOS's date and time from it.
+; (An XT with no RTC leaves it alone: INT 1Ah answers with the carry set.)
+; =============================================================================
+fix_clock:
+    ; READ BOTH FIRST. Setting DOS's date makes FreeDOS write its own time, which
+    ; is the stale tick-based one, back into the RTC - so a time read AFTER the
+    ; date is set is the snapshot's time again, and os8088's whole run is lost.
+    mov ah, 0x04
+    int 0x1A                        ; CH century, CL year, DH month, DL day, BCD
+    jc .no
+    mov al, dl
+    call bcd
+    mov [cl_day], al
+    mov al, dh
+    call bcd
+    mov [cl_mon], al
+    mov al, cl
+    call bcd
+    mov bl, al
+    mov al, ch
+    call bcd
+    mov cl, 100
+    mul cl                          ; AX = century * 100
+    xor bh, bh
+    add ax, bx
+    mov [cl_year], ax
+    mov ah, 0x02
+    int 0x1A                        ; CH hours, CL minutes, DH seconds, BCD
+    jc .no
+    mov al, ch
+    call bcd
+    mov [tmp_h], al
+    mov al, cl
+    call bcd
+    mov [tmp_m], al
+    mov al, dh
+    call bcd
+    mov [tmp_s], al
+    ; ...then set both. Hundredths 10, not 0: FreeDOS turns the time into BIOS
+    ; ticks and back by truncating, so a time set to :35.00 reads back :34
+    mov cx, [cl_year]
+    mov dh, [cl_mon]
+    mov dl, [cl_day]
+    mov ah, 0x2B
+    int 0x21
+    mov ch, [tmp_h]
+    mov cl, [tmp_m]
+    mov dh, [tmp_s]
+    mov dl, 10
+    mov ah, 0x2D
+    int 0x21
+.no:
+    ret
+cl_year dw 0
+cl_mon  db 0
+cl_day  db 0
+
+bcd:                                ; AL, packed BCD -> AL
+    push cx
+    mov ch, al
+    and ch, 0x0F
+    mov cl, 4
+    shr al, cl
+    mov cl, 10
+    mul cl
+    add al, ch
+    pop cx
     ret
 
 ; =============================================================================
@@ -659,7 +788,8 @@ make_swap:
     mov bx, ax
     mov cl, 4
     mov ax, [size_kb]
-    shr ax, cl                      ; chunks of 16KB
+    shr ax, cl                      ; chunks of 16KB...
+    add ax, VIDEO_KB / 16           ; ...and the video area's
     mov [swap_left], ax
     xor ax, ax
     mov [swap_seg], ax
@@ -1229,6 +1359,20 @@ report:                             ; ES = the block
     mov ax, [es:blk_ret_tick]
     call emit_hex16
     call emit_crlf
+    mov si, r_tsnap
+    call emit_str
+    mov ax, [t_snap+2]
+    call emit_hex16
+    mov ax, [t_snap]
+    call emit_hex16
+    call emit_crlf
+    mov si, r_taft
+    call emit_str
+    mov ax, [t_after+2]
+    call emit_hex16
+    mov ax, [t_after]
+    call emit_hex16
+    call emit_crlf
     mov si, r_nruns
     call emit_str
     mov ax, [es:blk_nruns]
@@ -1293,6 +1437,8 @@ r_ivt    db 'ivt_mismatches=', 0
 r_c08    db 'clean_int08=', 0
 r_cn     db 'clean_vectors=', 0
 r_nruns  db 'nruns=', 0
+r_tsnap  db 'dos_secs_snap=', 0
+r_taft   db 'dos_secs_after=', 0
 r_mode   db 'bootmode=', 0
 r_bfail  db 'bootfail=', 0
 r_tick0  db 'tick_at_boot=', 0
@@ -1390,6 +1536,9 @@ t_hd        dw 0
 t_sec0      dw 0
 t_n         dw 0
 t_run       dw 0
+t_rem       dw 0
+blk_img_secs dw 0
+blk_bounce  dw 0
 at_flag     db 0
 blk_err     dw 0
 blk_bootunit db 0
@@ -1399,7 +1548,18 @@ blk_pad2    db 0
 blk_snap_tick dw 0
 blk_ret_tick dw 0
 scr_seg     dw 0
-scr_len     dw 0
+v_mode      db 3
+v_text      db 1
+v_vga       db 0
+v_blink     db 0
+v_s2        db 0
+v_s4        db 0
+v_g4        db 0
+v_g5        db 0
+v_g6        db 0
+v_cur       dw 0
+v_shape     dw 0
+v_height    dw 0
 blk_fixirq  db 0
 blk_ivt_bad dw 0
 blk_clcnt   dw 0
@@ -1646,21 +1806,26 @@ image_io:
     xor ax, ax
     mov es, ax
     xor bx, bx
+    mov ax, [blk_img_secs]
+    mov [t_rem], ax                 ; the file goes on past the image: the video area
     mov si, blk_runs
     mov cx, [blk_nruns]
 .r: test cx, cx
     jz .ok
+    cmp word [t_rem], 0
+    je .ok
     push cx
     push si
     mov ax, [si]
     mov dx, [si+2]
     mov cx, [si+4]
+    cmp cx, [t_rem]
+    jbe .whole
+    mov cx, [t_rem]
+.whole:
+    sub [t_rem], cx
     push cs
-    call .near                      ; stub_rw ends in retf
-    jmp .back
-.near:
-    jmp stub_rw
-.back:
+    call stub_rw                    ; ends in retf: CS and IP are both on the stack
     pop si
     pop cx
     pushf
@@ -1841,7 +2006,7 @@ restore_all:
     mov [es:0x413], ax
     cmp byte [cs:blk_bootmode], 0
     je .novid
-    call restore_screen             ; os8088 left the card in a graphics mode
+    call restore_video              ; os8088 left the card in a graphics mode
 .novid:
     call pic_back
     mov ss, [cs:sv_ss]
@@ -1860,74 +2025,380 @@ restore_all:
     jmp $
 
 
-; ----- save_screen / restore_screen: the DOS text screen. It is video RAM, so
-;       it is not in the image; os8088 takes the card into a graphics mode and
-;       the BIOS mode set on the way back clears it. Page 0 of an 80-column
-;       text mode, up to 8,000 bytes (80x50). What is NOT kept: a loaded font,
-;       the palette, a split screen, other pages.
-save_screen:
+; ----- the DOS video state, kept in the swap file after the image -------------
+;       Video RAM is not in the image, and os8088 takes the card into a graphics
+;       mode that a BIOS mode set on the way back then clears. Streamed through
+;       a 1KB bounce buffer a sector at a time, so the hidden block stays small.
+;
+;       TEXT MODES ONLY. A host in a graphics mode comes back in 80x25 text:
+;       nothing is kept of the picture, and the mode set says so by clearing it.
+;
+;       The video area, in sectors after the image:
+;         0..15   the text screen, page 0, 8,192 bytes (80x50 is 8,000)
+;         16..31  VGA font plane 2, 256 glyphs x 32 bytes
+;         32..33  the DAC (768 bytes) then the 16 palette registers + overscan
+;       What is NOT kept: other pages, a split screen, a loaded font in a second
+;       bank, and anything on an adapter that is not VGA beyond the screen itself.
+
+; vid_rw: AX = sector of the video area, BX = a buffer in the block, [blk_op]
+; 2 read / 3 write. CF on failure. The file's extents are walked from the front,
+; because the video area may not be in the run the image ends in.
+vid_rw:
     push ds
     push es
-    xor ax, ax
-    mov es, ax
-    mov al, [es:0x449]
-    mov bx, 0xB800
-    cmp al, 7
-    jne .c
-    mov bx, 0xB000
-.c: mov [cs:scr_seg], bx
-    mov ax, [es:0x44A]              ; columns
-    mov cl, [es:0x484]              ; rows - 1, 0 when there is no EGA data
-    test cl, cl
-    jnz .r
-    mov cl, 24
-.r: inc cl
-    xor ch, ch
-    mul cx
-    shl ax, 1
-    cmp ax, 8000
-    jbe .l
-    mov ax, 8000
-.l: and ax, 0xFFFE
-    mov [cs:scr_len], ax
-    mov cx, ax
-    shr cx, 1
-    mov ds, bx
-    xor si, si
+    push si
+    push bp
+    push cx
+    push dx
+    mov dx, cs
+    mov ds, dx
+    mov es, dx
+    add ax, [blk_img_secs]          ; a sector of the FILE
+    mov si, blk_runs
+    mov cx, [blk_nruns]
+.run:
+    test cx, cx
+    jz .fail
+    mov dx, [si+4]
+    cmp ax, dx
+    jb .here
+    sub ax, dx
+    add si, 6
+    dec cx
+    jmp .run
+.here:
+    mov dx, [si+2]
+    mov bp, [si]
+    add bp, ax
+    adc dx, 0
+    mov ax, bp
+    mov cx, 1
     push cs
-    pop es
-    mov di, blk_screen
-    cld
-    rep movsw
+    call stub_rw                    ; DX:AX LBA, CX 1, ES:BX
+    jmp .out
+.fail:
+    stc
+.out:
+    pop dx
+    pop cx
+    pop bp
+    pop si
     pop es
     pop ds
     ret
 
-restore_screen:                     ; after the image: the BDA is DOS's again
+; vid_copy_out / vid_copy_in: 256 words between DS:SI-ish and the bounce.
+; font_open / font_close: the VGA's plane 2 mapped at A000:0, and put back
+font_open:
+    push ax
+    push dx
+    mov dx, 0x3C4
+    mov al, 2
+    out dx, al
+    inc dx
+    in al, dx
+    mov [v_s2], al
+    dec dx
+    mov al, 4
+    out dx, al
+    inc dx
+    in al, dx
+    mov [v_s4], al
+    mov dx, 0x3CE
+    mov al, 4
+    out dx, al
+    inc dx
+    in al, dx
+    mov [v_g4], al
+    dec dx
+    mov al, 5
+    out dx, al
+    inc dx
+    in al, dx
+    mov [v_g5], al
+    dec dx
+    mov al, 6
+    out dx, al
+    inc dx
+    in al, dx
+    mov [v_g6], al
+    mov dx, 0x3C4
+    mov ax, 0x0402                  ; map mask: plane 2
+    out dx, ax
+    mov ax, 0x0604                  ; sequential, no chain-4
+    out dx, ax
+    mov dx, 0x3CE
+    mov ax, 0x0204                  ; read map: plane 2
+    out dx, ax
+    mov ax, 0x0005                  ; read mode 0, write mode 0, odd/even off
+    out dx, ax
+    mov ax, 0x0406                  ; A000, 64KB
+    out dx, ax
+    pop dx
+    pop ax
+    ret
+font_close:
+    push ax
+    push dx
+    mov dx, 0x3C4
+    mov ah, [v_s2]
+    mov al, 2
+    out dx, ax
+    mov ah, [v_s4]
+    mov al, 4
+    out dx, ax
+    mov dx, 0x3CE
+    mov ah, [v_g4]
+    mov al, 4
+    out dx, ax
+    mov ah, [v_g5]
+    mov al, 5
+    out dx, ax
+    mov ah, [v_g6]
+    mov al, 6
+    out dx, ax
+    pop dx
+    pop ax
+    ret
+
+; save_video: at the boot, DOS's screen is still on the glass
+save_video:
     push ds
     push es
+    mov ax, cs
+    mov ds, ax
     xor ax, ax
     mov es, ax
     mov al, [es:0x449]
     and al, 0x7F
-    xor ah, ah
-    int 0x10                        ; DOS's own INT 10h chain, restored with it
+    mov [v_mode], al
+    mov byte [v_text], 1
+    mov bx, 0xB800
+    cmp al, 7
+    jne .col
+    mov bx, 0xB000
+.col:
+    mov [scr_seg], bx
+    cmp al, 3
+    jbe .text
+    cmp al, 7
+    je .text
+    mov byte [v_text], 0            ; graphics: nothing to keep
+    jmp .done
+.text:
+    mov word [blk_op], 3
+    ; --- the screen, 16 sectors -----------------------------------------------
+    xor bp, bp                      ; the sector
+.scr:
+    push ds
+    mov ds, [scr_seg]
+    mov si, bp
+    mov cl, 9
+    shl si, cl                      ; * 512
     push cs
-    pop ds
-    mov ax, [scr_seg]
-    mov es, ax
-    xor di, di
-    mov si, blk_screen
-    mov cx, [scr_len]
-    shr cx, 1
+    pop es
+    mov di, [cs:blk_bounce]
+    mov cx, 256
     cld
     rep movsw
+    pop ds
+    mov ax, bp
+    mov bx, [blk_bounce]
+    call vid_rw
+    inc bp
+    cmp bp, 16
+    jb .scr
+    ; --- VGA? ----------------------------------------------------------------------
+    mov byte [v_vga], 0
+    mov ax, 0x1A00
+    int 0x10
+    cmp al, 0x1A
+    jne .done
+    cmp bl, 7
+    jb .done
+    mov byte [v_vga], 1
+    ; --- the font ------------------------------------------------------------------
+    call font_open
+    xor bp, bp
+.fnt:
+    push ds
+    mov ax, 0xA000
+    mov ds, ax
+    mov si, bp
+    mov cl, 9
+    shl si, cl
+    push cs
+    pop es
+    mov di, [cs:blk_bounce]
+    mov cx, 256
+    cld
+    rep movsw
+    pop ds
+    mov ax, bp
+    add ax, 16
+    mov bx, [blk_bounce]
+    call vid_rw
+    inc bp
+    cmp bp, 16
+    jb .fnt
+    call font_close
+    ; --- the DAC and the palette registers ---------------------------------------
+    push cs
+    pop es
+    mov di, [blk_bounce]
+    mov dx, 0x3C7
+    xor al, al
+    out dx, al
+    mov dx, 0x3C9
+    mov cx, 768
+.dac:
+    in al, dx
+    stosb
+    loop .dac
+    mov dx, [blk_bounce]
+    add dx, 768
+    mov ax, 0x1009
+    int 0x10                        ; ES:DX <- the 16 registers and the overscan
+    mov ax, 32
+    mov bx, [blk_bounce]
+    call vid_rw
+    mov ax, 33
+    mov bx, [blk_bounce]
+    add bx, 512
+    call vid_rw
+.done:
+    pop es
+    pop ds
+    ret
+
+; restore_video: after the image, so the BDA is DOS's again
+restore_video:
+    push ds
+    push es
+    mov ax, cs
+    mov ds, ax
     xor ax, ax
     mov es, ax
-    mov dx, [es:0x450]              ; cursor, page 0: column in DL, row in DH
+    mov ax, [es:0x450]              ; cursor, page 0: column in AL, row in AH
+    mov [v_cur], ax
+    mov ax, [es:0x460]              ; cursor shape
+    mov [v_shape], ax
+    mov ax, [es:0x485]              ; character height
+    mov [v_height], ax
+    mov al, [es:0x465]              ; the CRT mode register: bit 5 is blink
+    mov [v_blink], al
+    mov al, 3                       ; a host that was in a graphics mode: text
+    cmp byte [v_text], 0
+    je .set
+    mov al, [v_mode]
+.set:
+    xor ah, ah
+    int 0x10                        ; DOS's own INT 10h chain, restored with it
+    cmp byte [v_text], 0
+    je .out
+    cmp byte [v_vga], 0
+    je .screen
+    ; --- the font's SHAPE (the mode's own line count) then its BITS -------------
+    mov ax, [v_height]
+    mov bl, 0
+    cmp al, 8
+    jne .h14
+    mov ax, 0x1112
+    int 0x10
+    jmp .fbits
+.h14:
+    cmp al, 14
+    jne .h16
+    mov ax, 0x1111
+    int 0x10
+    jmp .fbits
+.h16:
+    cmp al, 16
+    jne .fbits
+    mov ax, 0x1114
+    int 0x10
+.fbits:
+    mov word [blk_op], 2
+    call font_open
+    xor bp, bp
+.fnt:
+    mov ax, bp
+    add ax, 16
+    mov bx, [blk_bounce]
+    call vid_rw
+    push es
+    mov ax, 0xA000
+    mov es, ax
+    mov di, bp
+    mov cl, 9
+    shl di, cl
+    mov si, [blk_bounce]
+    mov cx, 256
+    cld
+    rep movsw
+    pop es
+    inc bp
+    cmp bp, 16
+    jb .fnt
+    call font_close
+    ; --- the palette ------------------------------------------------------------------
+    mov ax, 32
+    mov bx, [blk_bounce]
+    call vid_rw
+    mov ax, 33
+    mov bx, [blk_bounce]
+    add bx, 512
+    call vid_rw
+    mov si, [blk_bounce]
+    mov dx, 0x3C8
+    xor al, al
+    out dx, al
+    inc dx
+    mov cx, 768
+.dac:
+    lodsb
+    out dx, al
+    loop .dac
+    push cs
+    pop es
+    mov dx, [blk_bounce]
+    add dx, 768
+    mov ax, 0x1002
+    int 0x10                        ; ES:DX -> the 16 registers and the overscan
+    mov ax, 0x1003
+    mov bl, [v_blink]
+    mov cl, 5
+    shr bl, cl
+    and bl, 1
+    int 0x10                        ; blink or intensity
+.screen:
+    mov word [blk_op], 2
+    xor bp, bp
+.scr:
+    mov ax, bp
+    mov bx, [blk_bounce]
+    call vid_rw
+    push es
+    mov es, [scr_seg]
+    mov di, bp
+    mov cl, 9
+    shl di, cl
+    mov si, [blk_bounce]
+    mov cx, 256
+    cld
+    rep movsw
+    pop es
+    inc bp
+    cmp bp, 16
+    jb .scr
+    mov cx, [v_shape]
+    mov ah, 1
+    int 0x10
+    mov dx, [v_cur]
     xor bx, bx
     mov ah, 2
     int 0x10
+.out:
     pop es
     pop ds
     ret
@@ -1946,7 +2417,7 @@ stub_boot:
     mov es, ax
     mov ax, [es:0x46C]
     mov [blk_snap_tick], ax
-    call save_screen
+    call save_video
     ; the boot sector, to 0000:7C00, by the ROM's own INT 13h
     mov bp, 3
 .try:
@@ -2018,7 +2489,8 @@ stub_return:
 
 blk_runs    times (MAXRUNS * 6) db 0
 stub_end:
-blk_screen  equ stub_end            ; 8,000 bytes: runtime only, so no file bytes
-%if (stub_end - stub_start) + 8000 + 512 > HB_PARAS * 16
- %error "the hidden block is too small for the stub, the extents and the screen"
+; the bounce buffer follows, 1KB plus up to 511 bytes of alignment: runtime
+; only, so no file bytes
+%if (stub_end - stub_start) + 1024 + 512 + ST_STACK_USE > HB_PARAS * 16
+ %error "the hidden block is too small for the stub, the extents and the bounce"
 %endif
