@@ -1,6 +1,6 @@
 # `dosguest` - starting os8088 from DOS, and returning to it
 
-**Status: waves 1 and 2 are built and passing (sections 12, 13): os8088 boots from a FreeDOS prompt and Restart returns to it. Waves 3 to 6 are plan.**
+**Status: waves 1 and 2 are built and passing (sections 12 to 14): os8088 boots from a FreeDOS prompt, runs with real drivers resident, and Restart returns to a DOS whose clock, text video, vectors, memory and drivers are as they were. Not done: read-only enforcement, any DOS but FreeDOS, A20 restore, hard-disk boot.**
 
 **The ask:** run os8088 from a DOS prompt, and exit back to that prompt with
 DOS as it was. The first version takes the whole machine. A later version lets
@@ -175,6 +175,25 @@ case the earlier draft's thunk was for. `INT 15h` is unchecked: a BIOS disk
 call may chain through it (HIMEM hooks it), and a stub that runs HIMEM's code
 mid-restore is a crash. W4 tests it.
 
+**What wave 2 added to the policy (section 14):**
+
+8. **The table is wider than the hardware vectors.** The BIOS and os8088 reach
+   the IVT too: the ROM's INT 08h calls INT 1Ch, and os8088 calls INT 10h, 13h,
+   15h, 16h and 1Ah. Class 0 (IRQs and BIOS services) must name the ROM; class 1
+   (INT 1Bh, 1Ch, 4Ah and the CPU's 00h to 07h) becomes an IRET in the block
+   when it is in RAM. 36 vectors in all.
+9. **A guarded scan for plain chaining hooks.** HIMEMX hooks INT 15h and CTMOUSE
+   INT 10h, and use neither the sharing header nor FreeDOS's wrapper. The
+   launcher scans the first 128 bytes of the handler for `jmp far cs:[w]`,
+   `call far cs:[w]` or `jmp far imm` whose target is in ROM, and rejects a
+   target whose first byte is `FF` or `00`. **The first version had no such
+   check and took four bytes of HIMEMX's own code (`00 F0 33 C0`, `add al,dh;
+   xor ax,ax`) for a ROM vector; os8088 then called into nothing and hung.**
+   The scan is a heuristic, and `heuristic_unwraps=` in the report says how many
+   vectors a run rested on it. A hook that chains by pushing the old vector and
+   returning to it is not found and is refused.
+10. **V86 is refused**, after telling an 8086 or 186 apart by the flags.
+
 ### 4.3 Hardware state not in the image
 
 The image is memory only. The launcher saves the following into the hidden
@@ -186,9 +205,9 @@ machine, not to assume:
 | PIC masks, both | `in 21h` / `in A1h` | |
 | PIT channel 0 reload and mode | latch and read | os8088 reprograms it; the BDA tick count drifts by the time spent in os8088 |
 | keyboard controller | drain the output buffer; restore the command byte if changed | |
-| video mode and cursor | `int 10h` AH=0Fh, AH=03h; set on return | text-mode hosts only in v1 |
-| text video RAM | B800 (4 KB, active page) | the BIOS and os8088 will both have drawn on it |
-| A20 | read, restore | |
+| video: mode, screen, cursor, font, palette, blink | **DONE** (section 14) | text modes only, in the swap file's video area |
+| the clock | **DONE** (section 14) | set from the RTC after the resume |
+| A20 | **not done**; tested only with A20 on | the stub should read it and put it back |
 | RTC, DMA | not saved in v1 | documented as not preserved, as SPEC.md 87 does |
 
 DOS drivers that own hardware (mouse, sound, network) keep state in the device,
@@ -251,8 +270,15 @@ flag on the volume row. This is **a kernel change** and the one place the
 Resolve this in W0, before anything else, because it decides whether v1
 touches the kernel at all.
 
-A way to invalidate DOS's buffers on return would let a later version relax
-this. It is DOS-version-specific and out of scope.
+**What was measured about relaxing it (section 14):** a file added to C: by the
+host while os8088 runs, which is what os8088 writing there looks like to DOS, is
+invisible to DOS if its directory cache holds a stale sector, and visible after
+`INT 21h AH=0Dh` is called after the resume, on FreeDOS. That is enough for a
+FreeDOS host with no disk cache. It does not cover an XMS read cache
+(LBACACHE, SMARTDRV), whose contents cannot be reached from outside, or an
+MS-DOS host, whose disk reset may flush without invalidating. Neither could be
+tested here. **So read-only enforcement is still the rule until writes are
+allowed by a switch that refuses a host with such a cache.**
 
 ## 6. Exiting os8088
 
@@ -328,8 +354,8 @@ the launcher asks for it.
 | W0 | Answer open questions 1 and 2 on paper: how the kernel picks volumes, what `kmain` assumes of stage 2. Confirm `int 12h` is the only source of `mem_top` and that nothing reads the BDA word directly. Decide whether v1 touches the kernel. | this document updated |
 | W1 | **DONE.** Launcher: hidden block, swap file, extent list, stub, vector policy. No os8088. `dosguest/dg.asm`, `tests/dosguest.py` | a DOS machine restores itself byte for byte, and the swap file read back off the disk holds it |
 | W2 | **DONE, floppy and QEMU only.** Enter os8088 by booting its floppy's boot sector; exit by Restart; save and restore the DOS text screen. | boots to the desktop under FreeDOS in QEMU; Restart returns to the prompt (MartyPC and v86 not yet) |
-| W3 | Read-only enforcement (5). | a write to the host volume is refused; the host `CHKDSK` is clean afterwards |
-| W4 | A TSR and a disk cache on the host: refuse or survive, as designed. | `docs/TESTING.md` rows |
+| W3 | Read-only enforcement (5), and a `/W` switch that allows writes on a host with no disk cache that DOS reset can reach. | a write to the host volume is refused; the host `CHKDSK` is clean afterwards |
+| W4 | **MOSTLY DONE.** TSRs and real drivers, section 14. Still to do: MS-DOS, DR-DOS, FreeDOS 1.3, IBM DOS 3.30 (refused: it needs INT 25h's packet form, DOS 3.31+), SMARTDRV | `docs/TESTING.md` rows |
 | W5 | Real hardware: 5150, an AT, a machine with a mouse driver and a cache. | `docs/FIELD-MACHINES.md` |
 | W6 (optional) | MCB-aware image: skip free memory. | image size and round-trip time against the full image |
 
@@ -452,3 +478,67 @@ change, and not `emu.img`; dosguest does not need the VMware pointer):**
 - **Video state beyond the text screen:** a loaded font, the palette, other
   pages, graphics-mode hosts. A host in a graphics mode is not detected.
 - **A hard-disk os8088, MartyPC, v86, a real 8086, a second DOS.**
+
+## 14. Waves 2b to 2d: clock, video, TSRs, real drivers, a disk that changes
+
+All under FreeDOS 1.4 and QEMU, in `tests/dosguest.py` (about 4.5 minutes).
+
+**The clock.** DOS's time is the BIOS tick count at the snapshot, which stopped
+while os8088 ran. After the resume it is set from the RTC. Result: DOS's clock
+moved 11 s against 205 BIOS ticks (11.3 s). **Two traps:** reading the RTC time
+after setting DOS's date returns the stale time, because FreeDOS writes its own
+time back into the RTC when the date is set, so both are read first; and
+FreeDOS turns a time into ticks and back by truncating, so a time set to `:35.00`
+reads back `:34`, hence hundredths of 10.
+
+**Video, text modes only.** The screen (8 KB), VGA font plane 2 (8 KB) and the
+DAC and palette registers go to a 32 KB video area after the image in the swap
+file, streamed through a 1 KB bounce buffer, which is why the hidden block is
+8 KB and not 12. On return: mode set, the 8, 14 or 16-line font reloaded (which
+restores 43 and 50-line modes), the saved font and palette written back, then
+the screen, cursor shape and position. Result: after os8088 and Restart, mode,
+rows, font height, cursor, DAC entry 5, the custom glyph for `A` and the text on
+row 40 of an 80x50 screen are **byte-identical** to before. A host in a graphics
+mode comes back in 80x25 text. Not kept: other pages, a split screen, a second
+font bank, graphics.
+
+**TSRs.** A TSR hooking INT 1Ch, INT 09h (with a sharing header) and a service
+survives os8088, and its tick counter is still ticking and never went backwards
+afterwards. A hook the scan cannot see through is refused by name with nothing
+written.
+
+**Real drivers from the FreeDOS repository** (`tools/getfreedos.py --pkgs`,
+pinned SHA-256s):
+
+| driver | outcome |
+|---|---|
+| HIMEMX (XMS, hooks INT 15h) + CTMOUSE (hooks INT 10h) | accepted, os8088 runs; XMS version 3.00, free memory, A20 and the mouse driver identical before and after |
+| SHARE, NANSI.SYS, KEYB | accepted |
+| LBACACHE on XMS | accepted; **it is a read cache in XMS, so a disk that changes under it is not safe** |
+| JEMM386 | refused as V86 |
+
+**A disk that changes while os8088 runs.** See section 5. Reproduced on FreeDOS
+with a primed directory cache; fixed there by `INT 21h AH=0Dh` after the resume.
+A first fix that walked DOS's buffer chain crashed FreeDOS 2043, whose chain is
+not a simple list of headers; it was dropped.
+
+**Mistakes in my own tests that are worth keeping:**
+
+- The wait for os8088's desktop accepted DOS's black screen, because the pixel
+  counter counts black as "non-white". A run passed on timing. The wait now needs
+  a 20 to 80% dither and a `mem_top` that is a whole number of KB.
+- The pattern check clamped to the swap file's length, and the file now goes on
+  into the video area. It now clamps to the image.
+- Deleting the cached packages before checking the fetch worked, with the
+  network down.
+
+**Not done and not claimed:**
+
+- **A20 is not restored.** Only A20-on was tested, and it stayed on.
+- **Memory above 1 MB is not protected.** os8088's `XMEM.DRV` is not loaded,
+  but the test never allocated an XMS block and checked its contents.
+- **Any DOS but FreeDOS 1.4.** MS-DOS, DR-DOS, FreeDOS 1.3 and IBM DOS 3.30.
+  The last is refused: INT 25h's packet form needs DOS 3.31.
+- **SMARTDRV and write-behind caches**, which cannot be flushed from outside.
+- **Read-only enforcement**, which is still wave 3.
+- **QEMU only.** No MartyPC, 86Box, v86 or real 8086.
