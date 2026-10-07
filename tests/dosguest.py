@@ -168,6 +168,35 @@ def run_guest(work, ram_mb, defs=(), secs=120):
     return res, data
 
 
+def dos_session(work, auto_lines, files=(), secs=90):
+    """Boot FreeDOS, run AUTO_LINES from C:, power off. Returns (log, data.img)."""
+    com = os.path.join(work, "DG.COM")
+    sh("nasm", "-w+error", "-f", "bin", "-o", com, os.path.join(ROOT, "dosguest", "dg.asm"))
+    boot = os.path.join(work, "boot.img")
+    shutil.copy(getfreedos.IMG, boot)
+    cfg, auto = os.path.join(work, "cfg"), os.path.join(work, "auto")
+    with open(cfg, "wb") as f:
+        f.write(b"SHELL=\\FREEDOS\\BIN\\COMMAND.COM \\FREEDOS\\BIN /E:2048 /P=\\FDAUTO.BAT\r\n")
+    with open(auto, "wb") as f:
+        f.write(b"@echo off\r\nc:\r\n" + b"".join(l + b"\r\n" for l in auto_lines) +
+                b"a:\\freedos\\bin\\fdapm poweroff\r\n")
+    sh("mcopy", "-o", "-i", boot, cfg, "::FDCONFIG.SYS")
+    sh("mcopy", "-o", "-i", boot, auto, "::FDAUTO.BAT")
+    data = os.path.join(work, "data.img")
+    sh("mformat", "-C", "-T", "16384", "-h", "16", "-s", "63", "-i", data, "::")
+    sh("mcopy", "-o", "-i", data, com, "::DG.COM")
+    for f in files:
+        sh("mcopy", "-o", "-i", data, f, "::" + os.path.basename(f).upper())
+    p = subprocess.run(
+        ["qemu-system-i386", "-display", "none", "-no-reboot", "-m", "8",
+         "-drive", "file=%s,format=raw,if=floppy" % boot,
+         "-drive", "file=%s,format=raw,if=ide" % data, "-boot", "a"],
+        timeout=secs, capture_output=True)
+    check(p.returncode == 0, "the guest powered itself off (qemu exit %d)" % p.returncode)
+    log = subprocess.run(["mtype", "-i", data, "::LOG.TXT"], capture_output=True)
+    return log.stdout.decode("latin1"), data
+
+
 def hmp(sock, *cmds):
     r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "qmp.py"), sock, *cmds],
                        capture_output=True, text=True, cwd=ROOT)
@@ -204,7 +233,7 @@ def text_screen(sock, base=0xB8000, cols=80, rows=25):
     return [bytes(chars[r * cols:(r + 1) * cols]).decode("latin1").rstrip() for r in range(rows)]
 
 
-def run_boot(work, os_img):
+def run_boot(work, os_img, auto_lines=None, files=()):
     """Wave 2: `DG B:` with os8088 in B:, Restart by the mouse, DOS back."""
     com = os.path.join(work, "DG.COM")
     sh("nasm", "-w+error", "-f", "bin", "-o", com, os.path.join(ROOT, "dosguest", "dg.asm"))
@@ -217,8 +246,10 @@ def run_boot(work, os_img):
         f.write(b"SHELL=\\FREEDOS\\BIN\\COMMAND.COM \\FREEDOS\\BIN /E:2048 /P=\\FDAUTO.BAT\r\n")
     # no poweroff: the harness reads the screen first. `dir` and `ver` after the
     # launcher prove DOS's file layer and its own state came back, not only RAM
+    if auto_lines is None:
+        auto_lines = [b"dg /k b: > c:\\log.txt"]
     with open(auto, "wb") as f:
-        f.write(b"@echo off\r\nc:\r\ndg /k b: > c:\\log.txt\r\n"
+        f.write(b"@echo off\r\nc:\r\n" + b"".join(l + b"\r\n" for l in auto_lines) +
                 b"dir c:\\ > c:\\after.txt\r\nver >> c:\\after.txt\r\n"
                 b"echo DOSGUEST-BACK\r\n")
     sh("mcopy", "-o", "-i", boot, cfg, "::FDCONFIG.SYS")
@@ -226,6 +257,8 @@ def run_boot(work, os_img):
     data = os.path.join(work, "data.img")
     sh("mformat", "-C", "-T", "16384", "-h", "16", "-s", "63", "-i", data, "::")
     sh("mcopy", "-o", "-i", data, com, "::DG.COM")
+    for f in files:
+        sh("mcopy", "-o", "-i", data, f, "::" + os.path.basename(f).upper())
     sock = os.path.join(work, "q.sock")
     q = subprocess.Popen(
         ["qemu-system-i386", "-display", "none", "-no-reboot", "-m", "8",
@@ -245,13 +278,18 @@ def run_boot(work, os_img):
             if not os.path.exists(sock):
                 continue
             mt = peek16(sock, syms["mem_top"])
-            if mt and 0x8000 <= mt <= 0xA000:
+            # a whole number of KB, as the kernel makes it: DOS's own memory at
+            # that address is garbage until os8088 has put its variable there
+            if mt and 0x8000 <= mt <= 0xA000 and mt % 64 == 0:
                 shot = os.path.join(work, "desk.png")
                 m = re.search(r"(\d+(?:\.\d+)?)% non-white",
                               subprocess.run([sys.executable, os.path.join(ROOT, "tools", "shot.py"),
                                               sock, shot], capture_output=True, text=True,
                                              cwd=ROOT).stdout)
-                if m and float(m.group(1)) > 30:
+                # os8088's desktop is a dither, about half non-white; DOS's
+                # black screen is ALL non-white to this counter, which is what
+                # let an earlier version of this wait accept DOS
+                if m and 20 < float(m.group(1)) < 80:
                     info["mem_top"] = mt
                     break
         check("mem_top" in info, "os8088 reached a desktop under DOS (mem_top %s)"
@@ -385,6 +423,63 @@ def main():
                           "the swap file holds the pattern (read off the disk after os8088 ran)")
             finally:
                 shutil.rmtree(w3, ignore_errors=True)
+
+        # --- TSRs ---------------------------------------------------------
+        built = {}
+        tw = tempfile.mkdtemp(prefix="dosguest-tsr-")
+        try:
+            for name, src, defs in (("tsrok", "tsrok.asm", ()), ("tsrq", "tsrq.asm", ()),
+                                    ("tsrbad8", "tsrbad.asm", ()),
+                                    ("tsrbad10", "tsrbad.asm", ("-DVEC=0x10",))):
+                out = os.path.join(tw, name + ".com")
+                sh("nasm", "-w+error", *defs, "-f", "bin", "-o", out,
+                   os.path.join(ROOT, "tests", "dgtsr", src))
+                built[name] = out
+            print("TSRs the launcher must refuse:")
+            for name, vec in (("tsrbad8", "INT 08"), ("tsrbad10", "INT 10")):
+                wd = tempfile.mkdtemp(prefix="dosguest-bad-")
+                try:
+                    log, d = dos_session(wd, [name.encode() + b".com" if False else name.encode(),
+                                              b"dg > c:\\log.txt", b"echo ALIVE > c:\\alive.txt"],
+                                         files=[built[name]])
+                    check(vec in log and "RAM, not ROM" in log,
+                          "a plain hook on %s is refused, by name: %r" % (vec, log.strip()))
+                    check(subprocess.run(["mtype", "-i", d, "::ALIVE.TXT"],
+                                         capture_output=True).returncode == 0,
+                          "and DOS carries on after the refusal")
+                    check(subprocess.run(["mtype", "-i", d, "::DGSWAP.IMG"],
+                                         capture_output=True).returncode != 0,
+                          "and the launcher wrote nothing (no swap file)")
+                finally:
+                    shutil.rmtree(wd, ignore_errors=True)
+            if os.path.exists(os_img):
+                print("a TSR the launcher must carry through os8088:")
+                wd = tempfile.mkdtemp(prefix="dosguest-tsrok-")
+                try:
+                    back, d, info = run_boot(
+                        wd, os_img,
+                        auto_lines=[b"tsrok", b"tsrq > c:\\q1.txt",
+                                    b"dg /k b: > c:\\log.txt", b"tsrq > c:\\q2.txt"],
+                        files=[built["tsrok"], built["tsrq"]])
+                    r3 = read_result(d) if back else None
+                    check(r3 is not None and r3.get("resumed") == "1",
+                          "DG accepted a TSR hooking INT 09h (ISP), 1Ch and 60h and resumed")
+                    if r3 is not None:
+                        check(int(r3["mismatches"], 16) == 0 and int(r3["ivt_mismatches"], 16) == 0,
+                              "memory and the IVT came back with the TSR resident")
+                        q1 = subprocess.run(["mtype", "-i", d, "::Q1.TXT"], capture_output=True).stdout.decode().split()
+                        q2 = subprocess.run(["mtype", "-i", d, "::Q2.TXT"], capture_output=True).stdout.decode().split()
+                        print("  tsrq before: %s  after: %s" % (q1, q2))
+                        check(len(q1) == 3 and int(q1[1], 16) > int(q1[0], 16),
+                              "the TSR's INT 1Ch hook counts before the launcher")
+                        check(len(q2) == 3 and int(q2[1], 16) > int(q2[0], 16),
+                              "...and AFTER os8088 ran: the hook came back and is ticking")
+                        check(len(q2) == 3 and int(q2[0], 16) >= int(q1[1], 16),
+                              "its counter never went backwards (state restored, not rebuilt)")
+                finally:
+                    shutil.rmtree(wd, ignore_errors=True)
+        finally:
+            shutil.rmtree(tw, ignore_errors=True)
 
         # THE GUEST'S OWN NEGATIVE CONTROL: the same launcher with the restore
         # left out. The trash then wipes the launcher itself, so the honest

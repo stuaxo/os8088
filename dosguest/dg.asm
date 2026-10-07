@@ -187,7 +187,6 @@ main:
 .dosok:
     int 0x12
     mov [total_kb], ax
-    call build_clean
     MARK 'a'
     ; --- the hidden block, from the top of the arena ------------------------
     mov ax, 0x5801
@@ -214,6 +213,7 @@ main:
     mov [size_kb], ax
     ; --- install the stub, now, so its disk service is ours to use ----------
     call install_stub
+    call build_clean                ; needs the block: an IRET lives in it
     call save_vectors               ; the stub's int 13h needs these at once
     MARK 'b'
     ; --- everything free becomes a pattern, so the round trip has content ---
@@ -330,86 +330,122 @@ fail:
     int 0x21
 
 ; =============================================================================
-; the vector policy (plan 4.2). os8088 chains to whatever INT 08h and 09h hold
-; at boot, so the live IVT it is handed must name the ROM. DOS's own vectors
-; stay in the swap image and come back on the resume; what is built here is the
-; CLEAN set the stub puts in the live IVT after the snapshot.
+; the vector policy (plan 4.2). os8088 inherits the live IVT, and so does the
+; BIOS under it: the ROM's INT 08h handler calls INT 1Ch, its INT 09h calls
+; INT 1Bh on Ctrl-Break, its INT 70h calls INT 4Ah, and os8088 calls INT 10h,
+; 13h, 15h, 16h and 1Ah itself. A DOS or a TSR that hooked any of them has sent
+; the call into memory os8088 is about to overwrite. DOS's own vectors stay in
+; the swap image and come back on the resume; what is built here is the CLEAN
+; set the stub puts in the live IVT after the snapshot, and it covers every
+; vector in this table.
 ;
-; A vector already in ROM is its own clean value. Stock FreeDOS wraps every IRQ
-; vector in a stub of the form `call <handler>` followed by the original far
-; vector, stored inline; that stub is recognised and unwrapped. Anything else
-; in RAM is somebody's TSR, and the launcher refuses and says where it points.
-; INT 13h itself has to be in ROM: the stub's disk service is the only way back.
+; CLASS 0, a vector that is CALLED FOR ITS RESULT (an IRQ or a BIOS service): it
+; has to name the ROM. Already in ROM, it is its own clean value. Otherwise the
+; launcher follows it through the two shapes that keep the old vector inline -
+; the IBM Interrupt Sharing Protocol header (EB 10 | dd old | 'KB' | 00 | EB F4)
+; and FreeDOS's wrapper (E8 rel16 | dd old) - up to eight links. Anything else
+; in RAM is a TSR it cannot see through, and the launcher REFUSES, naming it.
+;
+; CLASS 1, a hook the BIOS makes and nothing depends on (INT 1Bh, 1Ch, 4Ah, and
+; the CPU's 00h to 07h): in ROM it stays; in RAM it becomes an IRET in the block.
+; That is what the ROM's own default is, so os8088 sees what a BIOS boot gives.
+;
+; Not in the table, left DOS's: INT 20h and up (DOS's, and os8088 never calls
+; them), and the data pointers 1Dh, 1Eh, 1Fh, 41h, 43h, 46h.
 ; =============================================================================
-vec_nums    db 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F
-            db 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77
-cleanvec    times 16 dd 0
-vec_idx     dw 0
+vec_tab     db 0x08, 0, 0x09, 0, 0x0A, 0, 0x0B, 0, 0x0C, 0, 0x0D, 0, 0x0E, 0, 0x0F, 0
+            db 0x70, 0, 0x71, 0, 0x72, 0, 0x73, 0, 0x74, 0, 0x75, 0, 0x76, 0, 0x77, 0
+            db 0x10, 0, 0x11, 0, 0x12, 0, 0x13, 0, 0x14, 0, 0x15, 0, 0x16, 0, 0x17, 0
+            db 0x1A, 0
+            db 0x00, 1, 0x01, 1, 0x02, 1, 0x03, 1, 0x04, 1, 0x05, 1, 0x06, 1, 0x07, 1
+            db 0x1B, 1, 0x1C, 1, 0x4A, 1
+            db 0xFF
+MAXVEC      equ 48
+cleanlist   times (MAXVEC * 6) db 0        ; vec word, off word, seg word
+cl_ptr      dw cleanlist
+cl_count    dw 0
+cl_i13      dw 0                    ; the entries the stub needs by name
+cl_i0e      dw 0
+cl_i76      dw 0
+vec_cur     dw 0
+cls_cur     db 0
 
 build_clean:
-    ; INT 13h: ROM or refuse
-    xor ax, ax
-    mov es, ax
-    mov dx, [es:0x13*4+2]
-    mov di, [es:0x13*4]
-    mov bx, 0x13
-    cmp dx, 0xC000
-    jb refuse_vec
-    xor si, si
-.l: mov bl, [vec_nums+si]
-    xor bh, bh
-    mov [vec_cur], bx
+    xor si, si                      ; into vec_tab, two bytes an entry
+.l: mov al, [vec_tab+si]
+    cmp al, 0xFF
+    je .done
+    xor ah, ah
+    mov [vec_cur], ax
+    mov al, [vec_tab+si+1]
+    mov [cls_cur], al
+    mov bx, [vec_cur]
     shl bx, 1
     shl bx, 1
     xor ax, ax
     mov es, ax
-    mov di, [es:bx]                 ; offset
+    mov ax, [es:bx]                 ; offset
     mov dx, [es:bx+2]               ; segment
-    mov ax, di
     mov cx, 8                       ; chain depth
 .chase:
     cmp dx, 0xC000
     jae .ok
-    ; in RAM. Two shapes are recognised, both of which keep the old vector
-    ; inline: the IBM Interrupt Sharing Protocol header
-    ;   EB 10 | dd old | 'KB' | 00 | EB F4 | ...
-    ; and FreeDOS's wrapper   E8 rel16 | dd old
     mov es, dx
     mov bx, ax
     cmp byte [es:bx], 0xEB
     jne .notiisp
     cmp byte [es:bx+1], 0x10
-    jne .no
+    jne .nope
     cmp word [es:bx+6], 0x424B
-    jne .no
+    jne .nope
     mov ax, [es:bx+2]
     mov dx, [es:bx+4]
     jmp .again
 .notiisp:
     cmp byte [es:bx], 0xE8
-    jne .no
+    jne .nope
     mov ax, [es:bx+3]
     mov dx, [es:bx+5]
 .again:
     loop .chase
-.no:
+.nope:
+    cmp byte [cls_cur], 0
+    jne .iret
+    mov di, ax                      ; where it points: DX:DI
     mov bx, [vec_cur]
-    mov di, ax
     jmp refuse_vec
+.iret:
+    mov ax, STUB_IRET
+    mov dx, [hseg]
 .ok:
-    push si
-    shl si, 1
-    shl si, 1
-    mov [cleanvec+si], ax
-    mov [cleanvec+si+2], dx
-    pop si
-    inc si
-    cmp si, 16
-    jb .l
+    mov di, [cl_ptr]
+    mov bx, [vec_cur]
+    cmp bx, 0x13
+    jne .n13
+    mov cx, [cl_count]
+    mov [cl_i13], cx
+.n13:
+    cmp bx, 0x0E
+    jne .n0e
+    mov cx, [cl_count]
+    mov [cl_i0e], cx
+.n0e:
+    cmp bx, 0x76
+    jne .n76
+    mov cx, [cl_count]
+    mov [cl_i76], cx
+.n76:
+    mov [di], bx
+    mov [di+2], ax
+    mov [di+4], dx
+    add word [cl_ptr], 6
+    inc word [cl_count]
+    add si, 2
+    jmp .l
+.done:
     push cs
     pop es
     ret
-vec_cur dw 0
 
 ; refuse_vec: BX = vector, DX:DI = where it points
 refuse_vec:
@@ -508,18 +544,42 @@ save_vectors:
     push es
     xor ax, ax
     mov es, ax
-    mov ax, [es:0x13*4]
-    mov dx, [es:0x13*4+2]
     mov bx, [es:0x413]
     mov es, [hseg]
-    mov [es:blk_rom13], ax
-    mov [es:blk_rom13+2], dx
     mov [es:blk_orig_kb], bx
-    mov si, cleanvec
-    mov di, blk_clean
-    mov cx, 32
-    rep movsw                       ; 16 vectors, 2 words each
+    ; the clean list, and by name the three entries the stub uses directly
+    mov ax, [cl_count]
+    mov [es:blk_clcnt], ax
+    mov si, cleanlist
+    mov di, blk_cl
+    mov cx, MAXVEC * 3
+    rep movsw
+    mov bx, [cl_i13]
+    call .ent
+    mov ax, [si+2]
+    mov [es:blk_rom13], ax
+    mov ax, [si+4]
+    mov [es:blk_rom13+2], ax
+    mov bx, [cl_i0e]
+    call .ent
+    mov ax, [si+2]
+    mov [es:blk_cl0e], ax
+    mov ax, [si+4]
+    mov [es:blk_cl0e+2], ax
+    mov bx, [cl_i76]
+    call .ent
+    mov ax, [si+2]
+    mov [es:blk_cl76], ax
+    mov ax, [si+4]
+    mov [es:blk_cl76+2], ax
     pop es
+    ret
+.ent:                               ; BX = entry -> SI = its address in cleanlist
+    mov si, bx
+    shl si, 1
+    add si, bx                      ; * 3
+    shl si, 1                       ; * 6
+    add si, cleanlist
     ret
 
 ; =============================================================================
@@ -1132,11 +1192,16 @@ report:                             ; ES = the block
     call emit_crlf
     mov si, r_c08
     call emit_str
-    mov ax, [es:blk_clean+2]
+    mov ax, [es:blk_cl+4]
     call emit_hex16
     mov al, ':'
     call emit_ch
-    mov ax, [es:blk_clean]
+    mov ax, [es:blk_cl+2]
+    call emit_hex16
+    call emit_crlf
+    mov si, r_cn
+    call emit_str
+    mov ax, [es:blk_clcnt]
     call emit_hex16
     call emit_crlf
     mov si, r_unit
@@ -1226,6 +1291,7 @@ r_after  db 'int12_after=', 0
 r_unit   db 'unit=', 0
 r_ivt    db 'ivt_mismatches=', 0
 r_c08    db 'clean_int08=', 0
+r_cn     db 'clean_vectors=', 0
 r_nruns  db 'nruns=', 0
 r_mode   db 'bootmode=', 0
 r_bfail  db 'bootfail=', 0
@@ -1288,11 +1354,13 @@ STUB_TRASH   equ 3
 STUB_RW      equ 6
 STUB_BOOT    equ 9
 STUB_RETURN  equ 12
+STUB_IRET    equ 15
     jmp stub_suspend                ; +0   far call: write the snapshot
     jmp stub_trash                  ; +3   far call: trash, then restore
     jmp stub_rw                     ; +6   far call: DX:AX LBA, CX count
     jmp stub_boot                   ; +9   far call: boot os8088; no return
     jmp stub_return                 ; +12  INT 19h's target while os8088 runs
+    iret                            ; +15  what a hook the BIOS makes becomes
 
 ; ----- the block's data, at fixed offsets --------------------------------------
 blk_seg     dw 0
@@ -1334,8 +1402,13 @@ scr_seg     dw 0
 scr_len     dw 0
 blk_fixirq  db 0
 blk_ivt_bad dw 0
-blk_clean   times 16 dd 0           ; the ROM vectors, 08-0F then 70-77
-blk_dosvec  times 16 dd 0           ; DOS's, as the live IVT held them
+blk_clcnt   dw 0
+blk_cl      times (MAXVEC * 6) db 0 ; the clean list: vec word, off word, seg word
+blk_dosvec  times (MAXVEC * 4) db 0 ; DOS's, as the live IVT held them
+blk_cl0e    dw 0, 0                 ; the clean INT 0Eh and 76h, for the disk IRQs
+blk_cl76    dw 0, 0
+blk_dos0e   dw 0, 0                 ; DOS's own, found by ivt_op's save pass
+blk_dos76   dw 0, 0
 
 ; ----- bios: INT 13h through the saved ROM vector, immune to the IVT's restore -
 bios13:
@@ -1345,13 +1418,13 @@ bios13:
     push es
     xor ax, ax
     mov es, ax
-    mov ax, [cs:blk_clean + 6*4]        ; INT 0Eh: the floppy's IRQ
+    mov ax, [cs:blk_cl0e]               ; INT 0Eh: the floppy's IRQ
     mov [es:0x38], ax
-    mov ax, [cs:blk_clean + 6*4 + 2]
+    mov ax, [cs:blk_cl0e + 2]
     mov [es:0x3A], ax
-    mov ax, [cs:blk_clean + 14*4]       ; INT 76h: the hard disk's
+    mov ax, [cs:blk_cl76]               ; INT 76h: the hard disk's
     mov [es:0x1D8], ax
-    mov ax, [cs:blk_clean + 14*4 + 2]
+    mov ax, [cs:blk_cl76 + 2]
     mov [es:0x1DA], ax
     pop es
     pop ax
@@ -1360,23 +1433,8 @@ bios13:
     call far [cs:blk_rom13]
     ret
 
-; ivt_addr: BX = index 0..15 -> BX = the vector's address in the IVT
-ivt_addr:
-    cmp bx, 8
-    jae .hi
-    shl bx, 1
-    shl bx, 1
-    add bx, 0x20
-    ret
-.hi:
-    sub bx, 8
-    shl bx, 1
-    shl bx, 1
-    add bx, 0x1C0
-    ret
-
-; ivt_op: AL=0 save the live IVT to blk_dosvec, 1 apply blk_clean, 2 compare
-; (the number that differ goes to blk_ivt_bad)
+; ivt_op: AL=0 save the live IVT to blk_dosvec, 1 apply the clean list, 2
+; compare (the number that differ goes to blk_ivt_bad)
 ivt_op:
     push ds
     push es
@@ -1385,17 +1443,19 @@ ivt_op:
     push bx
     push cx
     mov [cs:op_al], al
-    xor ax, ax
-    mov es, ax
     mov ax, cs
     mov ds, ax
-    xor si, si
+    xor ax, ax
+    mov es, ax
     mov word [blk_ivt_bad], 0
-.v: mov bx, si
-    call ivt_addr
-    mov di, si
-    shl di, 1
-    shl di, 1
+    xor si, si                      ; the entry, 6 bytes
+    xor di, di                      ; DOS's copy, 4 bytes
+    mov cx, [blk_clcnt]
+.v: test cx, cx
+    jz .done
+    mov bx, [blk_cl+si]
+    shl bx, 1
+    shl bx, 1                       ; the vector's address in the IVT
     mov al, [op_al]
     test al, al
     jnz .notsave
@@ -1403,13 +1463,26 @@ ivt_op:
     mov [blk_dosvec+di], ax
     mov ax, [es:bx+2]
     mov [blk_dosvec+di+2], ax
+    cmp bx, 0x38
+    jne .s1
+    mov ax, [es:bx]
+    mov [blk_dos0e], ax
+    mov ax, [es:bx+2]
+    mov [blk_dos0e+2], ax
+.s1:
+    cmp bx, 0x1D8
+    jne .nx
+    mov ax, [es:bx]
+    mov [blk_dos76], ax
+    mov ax, [es:bx+2]
+    mov [blk_dos76+2], ax
     jmp .nx
 .notsave:
     cmp al, 1
     jne .cmp
-    mov ax, [blk_clean+di]
+    mov ax, [blk_cl+si+2]
     mov [es:bx], ax
-    mov ax, [blk_clean+di+2]
+    mov ax, [blk_cl+si+4]
     mov [es:bx+2], ax
     jmp .nx
 .cmp:
@@ -1422,9 +1495,11 @@ ivt_op:
 .bad:
     inc word [blk_ivt_bad]
 .nx:
-    inc si
-    cmp si, 16
-    jb .v
+    add si, 6
+    add di, 4
+    dec cx
+    jmp .v
+.done:
     pop cx
     pop bx
     pop di
@@ -1750,13 +1825,13 @@ restore_all:
     xor ax, ax
     mov es, ax
     ; DOS's INT 0Eh and 76h, which the last disk call had replaced
-    mov ax, [cs:blk_dosvec + 6*4]
+    mov ax, [cs:blk_dos0e]
     mov [es:0x38], ax
-    mov ax, [cs:blk_dosvec + 6*4 + 2]
+    mov ax, [cs:blk_dos0e + 2]
     mov [es:0x3A], ax
-    mov ax, [cs:blk_dosvec + 14*4]
+    mov ax, [cs:blk_dos76]
     mov [es:0x1D8], ax
-    mov ax, [cs:blk_dosvec + 14*4 + 2]
+    mov ax, [cs:blk_dos76 + 2]
     mov [es:0x1DA], ax
     mov al, 2
     call ivt_op                     ; the IVT is DOS's again, or it is not
