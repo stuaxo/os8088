@@ -4200,7 +4200,7 @@ SOAK = [
         "without vstart=0, a near `ret` under a FAR call, and the ON-DISK "
         "record offsets read out of a SYNTHESIZED entry.",
         needs=("marty",), serial=True),
-    Row("dosguest", "soak", py("tests/dosguest.py"), 75.0,
+    Row("dosguest", "soak", py("tests/dosguest.py"), 270.0,
         "DOS IS SUSPENDED TO A FILE AND PUT BACK (docs/plans/DOSGUEST-PLAN.md "
         "wave 1): dosguest/dg.asm, under a REAL FreeDOS in QEMU, takes a hidden "
         "block off the top of the arena (int 12h then answers the smaller "
@@ -4224,8 +4224,18 @@ SOAK = [
         "is intact, the IVT is DOS's, the BIOS tick moved, `dir` works, and the "
         "DOS screen from before the launcher is on the glass again (video RAM is "
         "not in the image, so that is the stub's own save and restore). "
-        "SOAK: it boots two guests, and needs a DOS that is fetched, not "
-        "shipped (`python3 tools/getfreedos.py`)",
+        "THEN THE THINGS A REAL DOS HAS: the clock (DOS's time moves on by "
+        "the time os8088 ran, from the RTC), the text video state (80x50, a "
+        "custom glyph, a palette entry, the cursor, text on row 40: IDENTICAL "
+        "after; a graphics-mode host comes back in text), TSRs the launcher "
+        "must carry (an ISP header, INT 1Ch, a service) or refuse by name, and "
+        "REAL drivers from the FreeDOS repository - HIMEMX and CTMOUSE through "
+        "os8088 with the XMS driver's version, free memory, A20 and the mouse "
+        "driver identical afterwards, SHARE/NANSI/KEYB/LBACACHE accepted, "
+        "JEMM386 refused as V86 - and a file the HOST adds to C: while os8088 "
+        "runs, which DOS cannot see unless it is told to re-read. "
+        "SOAK, about 4.5 minutes: it boots fourteen guests, and needs a DOS "
+        "that is fetched, not shipped (`python3 tools/getfreedos.py --pkgs`)",
         needs=("nasm", "qemu", "mtools", "freedos"),
         wants=("build/os8088.img",)),
     Row("kdos", "soak", py("tests/kdos.py"), 10.0,

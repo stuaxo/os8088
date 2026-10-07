@@ -69,6 +69,8 @@ pseg        dw 0                    ; the pattern block
 pparas      dw 0
 drive       db 0                    ; 0 = A
 keep        db 0
+prime       db 0                    ; /P: re-populate DOS's directory cache (a test)
+noinval     db 0                    ; /N: skip invalidating DOS's buffers (a test)
 t_snap      dw 0, 0                 ; seconds of the day at the snapshot, and after
 t_after     dw 0, 0
 tmp_h       db 0
@@ -175,8 +177,18 @@ main:
     lodsb
     and al, 0xDF
     cmp al, 'K'
-    jne .cl
+    jne .sw2
     mov byte [keep], 1
+    jmp .cl
+.sw2:
+    cmp al, 'P'
+    jne .sw3
+    mov byte [prime], 1
+    jmp .cl
+.sw3:
+    cmp al, 'N'
+    jne .cl
+    mov byte [noinval], 1
     jmp .cl
 .badboot:
     mov dx, msg_boot
@@ -236,6 +248,7 @@ main:
     MARK 'q'
     ; --- the swap file, through DOS: it allocates the clusters --------------
     call make_swap
+    call prime_cache
     MARK 'd'
     ; --- the volume, its unit, and the file's extents -----------------------
     call read_bpb
@@ -279,6 +292,10 @@ main:
 
 resumed:
     MARK 'R'
+    cmp byte [noinval], 0
+    jne .nobuf
+    call inval_buffers
+.nobuf:
     call fix_clock
     call dos_secs
     mov [t_after], ax
@@ -727,6 +744,43 @@ save_vectors:
     shl si, 1                       ; * 6
     add si, cleanlist
     ret
+
+; =============================================================================
+; inval_buffers: after the resume, DOS's disk buffers are the snapshot's, and
+; os8088 may have changed the disk since. INT 21h AH=0Dh, the documented disk
+; reset, is the only handle on them that does not depend on one DOS's layout.
+;
+; On FreeDOS it FLUSHES AND MARKS EVERY BUFFER INVALID, which is why the launcher
+; calls it before the snapshot (make_swap) and why a FreeDOS host has nothing
+; stale to come back to; calling it again here covers a buffer filled between
+; the two. MS-DOS's is documented as a flush, and WHETHER IT ALSO INVALIDATES IS
+; NOT KNOWN HERE: no MS-DOS to test on. Do not rely on this for an MS-DOS host
+; until it has been measured there (docs/plans/DOSGUEST-PLAN.md 14).
+;
+; A first version walked the buffer chain from the list of lists (+12h) and
+; marked each header unused. It crashed FreeDOS 2043: that chain is not a simple
+; list of headers (its second link points into COMMAND.COM's memory), and
+; writing into a DOS structure laid out the way one DOS version happens to is
+; the kind of fix that works on the machine it was written on.
+; =============================================================================
+inval_buffers:
+    mov ah, 0x0D
+    int 0x21
+    ret
+
+; prime_cache (/P, a test): after make_swap's disk reset, read the root directory
+; through DOS, so the cache holds a directory sector when the snapshot is taken.
+; That is the state an MS-DOS host is in anyway.
+prime_cache:
+    cmp byte [prime], 0
+    je .no
+    mov dx, primespec
+    mov cx, 0x16
+    mov ah, 0x4E
+    int 0x21
+.no:
+    ret
+primespec db '\*.*', 0
 
 ; =============================================================================
 ; dos_secs: DOS's clock as seconds since midnight, DX:AX

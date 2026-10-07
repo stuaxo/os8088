@@ -234,7 +234,7 @@ def text_screen(sock, base=0xB8000, cols=80, rows=50):
     return [bytes(chars[r * cols:(r + 1) * cols]).decode("latin1").rstrip() for r in range(rows)]
 
 
-def run_boot(work, os_img, auto_lines=None, files=(), cfg_extra=()):
+def run_boot(work, os_img, auto_lines=None, files=(), cfg_extra=(), during=None):
     """Wave 2: `DG B:` with os8088 in B:, Restart by the mouse, DOS back."""
     com = os.path.join(work, "DG.COM")
     sh("nasm", "-w+error", "-f", "bin", "-o", com, os.path.join(ROOT, "dosguest", "dg.asm"))
@@ -314,6 +314,8 @@ def run_boot(work, os_img, auto_lines=None, files=(), cfg_extra=()):
                             f.write("== %s\n" % name)
                             f.write(hmp(sock, "xp /%dxb 0x%x" % (n, addr)))
             return None, data, info
+        if during is not None:
+            during(osd, data)            # while os8088 runs: the host changes a disk
         tk = peek16(sock, syms["ticks"])
         time.sleep(3)
         tk2 = peek16(sock, syms["ticks"])
@@ -335,6 +337,13 @@ def run_boot(work, os_img, auto_lines=None, files=(), cfg_extra=()):
                 break
         info["screen"] = text_screen(sock)
         check(back, "Restart took os8088 out and DOS ran on (DOSGUEST-BACK on the screen)")
+        if not back and os.environ.get("DG_SHOT"):
+            subprocess.run([sys.executable, os.path.join(ROOT, "tools", "shot.py"), sock,
+                            os.environ["DG_SHOT"]], capture_output=True, cwd=ROOT)
+            with open(os.environ["DG_SHOT"] + ".regs", "w") as f:
+                regs = hmp(sock, "info registers")
+                f.write(regs)
+                f.write("\n".join(l for l in info["screen"] if l.strip()))
     finally:
         q.terminate()
         try:
@@ -549,6 +558,36 @@ def main():
                     shutil.rmtree(wd, ignore_errors=True)
         finally:
             shutil.rmtree(tw, ignore_errors=True)
+
+        # --- the disk changes while os8088 runs ------------------------------
+        # Whoever writes the volume, DOS cannot tell: here the HOST adds a file to
+        # C: while os8088 runs, which is what os8088 writing there looks like from
+        # DOS's side. Without /P the launcher's own disk reset has already emptied
+        # FreeDOS's cache and there is nothing stale to find; /P re-populates the
+        # directory cache before the snapshot (the state an MS-DOS host is in), and
+        # /N then leaves out the invalidation after the resume.
+        if os.path.exists(os_img):
+            print("the disk changes while os8088 runs (a file added to C: by the host):")
+            for flags, expect, what in ((b"/p /n", False, "CONTROL, primed cache and no invalidation: DOS cannot see it"),
+                                        (b"/p", True, "primed cache, disk reset after the resume: DOS sees it")):
+                ww = tempfile.mkdtemp(prefix="dosguest-wr-")
+                try:
+                    hostfile = os.path.join(ww, "HOSTC.TXT")
+                    with open(hostfile, "w") as hf:
+                        hf.write("written by the host to C: while os8088 ran\r\n")
+
+                    def during(osd, data, hostfile=hostfile):
+                        subprocess.run(["mcopy", "-o", "-i", data, hostfile, "::HOSTC.TXT"], check=True)
+                    back, d, info = run_boot(
+                        ww, os_img,
+                        auto_lines=[b"dg /k " + flags + b" b: > c:\\log.txt", b"dir c:\\ > c:\\h1.txt",
+                                    b"type c:\\hostc.txt > c:\\h2.txt"],
+                        during=during)
+                    t = lambda f: subprocess.run(["mtype", "-i", d, "::" + f], capture_output=True).stdout.decode("latin1")
+                    seen = "HOSTC" in t("H1.TXT") and "written by the host" in t("H2.TXT")
+                    check(bool(back) and seen == expect, "%s" % what)
+                finally:
+                    shutil.rmtree(ww, ignore_errors=True)
 
         # --- REAL DRIVERS, from the FreeDOS repository ---------------------
         # A toy TSR proves what its author thought of. These are somebody else's.
