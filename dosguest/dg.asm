@@ -5,7 +5,8 @@
 ; file; then either trash what os8088 would trash and put DOS back (the
 ; self-test), or BOOT os8088 from a floppy, and put DOS back when it Restarts.
 ;
-;   DG.COM        the self-test, no os8088; writes \DGRESULT.TXT and prints it
+;   DG.COM        prints what to type
+;   DG.COM /T     the self-test, no os8088; writes \DGRESULT.TXT
 ;   DG.COM B:     boot os8088 from the floppy in B: (or A:). Its Restart is the
 ;                 way home: the launcher points INT 19h at the stub
 ;   DG.COM /K     ...either way, keep \DGSWAP.IMG so the host can read it back
@@ -81,6 +82,7 @@ wflag       db 0                    ; /W: let os8088 WRITE (see wmask); the defa
 wmask       db 0                    ; bit n = floppy n, bit 7 = any hard disk
 wtest       db 0                    ; /F: try a write through the live INT 13h (a test)
 verbose     db 0                    ; /V: print the report, not only write it
+selftest    db 0                    ; /T: the self-test
 t_snap      dw 0, 0                 ; seconds of the day at the snapshot, and after
 t_after     dw 0, 0
 tmp_h       db 0
@@ -127,6 +129,13 @@ msg_boot    db 'DG: the drive to boot os8088 from is a letter A: to Z:', 13, 10,
 msg_loc     db 'DG: cannot find that drive on the BIOS (is it a hard-disk volume DOS owns?)', 13, 10, '$'
 msg_v86     db 'DG: the CPU is in protected or virtual-8086 mode (EMM386, JEMM, QEMM, Windows)', 13, 10
             db '    os8088 needs the real machine. Boot without the memory manager.', 13, 10, '$'
+msg_usage   db 'DG: start os8088 from DOS, and come back to DOS when it Restarts.', 13, 10, 13, 10
+            db '  DG B:     boot os8088 from the floppy in drive B: (or A:)', 13, 10
+            db '  DG D:     boot an os8088 hard-disk install from DOS drive D: (any letter)', 13, 10, 13, 10
+            db 'In os8088, System menu (the logo, top left) then Restart returns you here', 13, 10
+            db 'with your screen, clock, drivers and memory as they were. os8088 may not', 13, 10
+            db 'write to your disks unless you add /W (boot unit), /WH (hard disks) or /W*.', 13, 10, 13, 10
+            db 'Options: /K keep \DGSWAP.IMG   /V print the report   /T self-test, no os8088', 13, 10, '$'
 msg_back    db 'DG: DOS is back. The report is in \DGRESULT.TXT.', 13, 10, '$'
 msg_dos     db 'DG: needs DOS 3.0 or later', 13, 10, '$'
 msg_mem     db 'DG: cannot allocate the hidden block', 13, 10, '$'
@@ -239,6 +248,11 @@ main:
     mov byte [verbose], 1           ; /V: the whole report on the console as well
     jmp .cl
 .sw8b:
+    cmp al, 'T'
+    jne .sw8c
+    mov byte [selftest], 1          ; /T: suspend, trash, restore - and no os8088
+    jmp .cl
+.sw8c:
     cmp al, 'C'
     jne .sw9
     mov byte [chsonly], 1
@@ -280,6 +294,19 @@ main:
     mov dx, msg_boot
     jmp fail
 .cldone:
+    ; no drive and no /T: a person typed DG. Say what it is for - the self-test used to
+    ; run here, which suspends DOS, trashes memory, restores it and says "DOS is back",
+    ; and leaves the reader with no idea that os8088 was never started
+    cmp byte [bootmode], 0
+    jne .haveaction
+    cmp byte [selftest], 0
+    jne .haveaction
+    mov dx, msg_usage
+    mov ah, 0x09
+    int 0x21
+    mov ax, 0x4C01
+    int 0x21
+.haveaction:
     ; --- DOS 3.0 or later. 3.31 and up read the boot sector with INT 25h's packet
     ; form, which names a sector with 32 bits; 3.0 to 3.30 have only the classic
     ; form (a 16-bit sector number), so a volume over 32 MB is out of reach there.

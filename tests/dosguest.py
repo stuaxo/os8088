@@ -180,7 +180,7 @@ def run_guest(work, ram_mb, defs=(), secs=120, flags=b"", big=False):
     com = os.path.join(work, "DG.COM")
     sh("nasm", "-w+error", *defs, "-f", "bin", "-o", com,
        os.path.join(ROOT, "dosguest", "dg.asm"))
-    boot = HOST.boot_image(work, [b"dg /k " + flags + b" > c:\\log.txt"])
+    boot = HOST.boot_image(work, [b"dg /t /k " + flags + b" > c:\\log.txt"])
     data = os.path.join(work, "data.img")
     datai = data                      # what mtools' -i is given: the offset form for a big disk
     if big:
@@ -625,7 +625,7 @@ def scenarios(host):
                 wd = tempfile.mkdtemp(prefix="dosguest-bad-")
                 try:
                     log, d = dos_session(wd, [name.encode() + b".com" if False else name.encode(),
-                                              b"dg > c:\\log.txt", b"echo ALIVE > c:\\alive.txt"],
+                                              b"dg /t > c:\\log.txt", b"echo ALIVE > c:\\alive.txt"],
                                          files=[built[name]])
                     check(vec in log and "RAM, not ROM" in log,
                           "a plain hook on %s is refused, by name: %r" % (vec, log.strip()))
@@ -726,6 +726,20 @@ def scenarios(host):
                           what + " (%s)" % (rb if not isinstance(rb, dict) else "ran"))
             finally:
                 shutil.rmtree(wd, ignore_errors=True)
+
+        # --- a person types DG with nothing after it -----------------------------
+        # It used to run the self-test, which suspends DOS, trashes memory, restores it and
+        # prints "DOS is back" - and never starts os8088. A bare DG now says what to type.
+        wd = tempfile.mkdtemp(prefix="dosguest-usage-")
+        try:
+            log, d = dos_session(wd, [b"dg > c:\\log.txt", b"echo ALIVE > c:\\alive.txt"])
+            check("DG B:" in log and "Restart" in log,
+                  "a bare DG prints what to type, not a self-test result: %r" % log.strip()[:50])
+            check(subprocess.run(["mtype", "-i", d, "::DGSWAP.IMG"], capture_output=True).returncode != 0
+                  and subprocess.run(["mtype", "-i", d, "::ALIVE.TXT"], capture_output=True).returncode == 0,
+                  "...and it touched nothing")
+        finally:
+            shutil.rmtree(wd, ignore_errors=True)
 
         # --- DOS 3.0 to 3.30: INT 25h's classic form ----------------------------
         # No DOS 3.x is here to run it on, so this proves the PATH and not that DOS.
@@ -964,7 +978,7 @@ def scenarios(host):
                          (b"DEVICE=C:\\HIMEMX.EXE",), [b"lbacache"])):
                     wd = tempfile.mkdtemp(prefix="dosguest-acc-")
                     try:
-                        log, d = dos_session(wd, lines + [b"dg /k > c:\\log.txt"], files=files, cfg_extra=cfg)
+                        log, d = dos_session(wd, lines + [b"dg /t /k > c:\\log.txt"], files=files, cfg_extra=cfg)
                         ra = read_result(d)
                         check(ra is not None and ra.get("resumed") == "1" and int(ra["mismatches"], 16) == 0,
                               "%s is accepted and DOS comes back" % name)
@@ -973,7 +987,7 @@ def scenarios(host):
                 print("a memory manager that puts DOS in virtual-8086 mode must be refused:")
                 wd = tempfile.mkdtemp(prefix="dosguest-v86-")
                 try:
-                    log, d = dos_session(wd, [b"dg > c:\\log.txt", b"echo ALIVE > c:\\alive.txt"],
+                    log, d = dos_session(wd, [b"dg /t > c:\\log.txt", b"echo ALIVE > c:\\alive.txt"],
                                          files=[HM, pk("jemm", "BIN/JEMM386.EXE")],
                                          cfg_extra=(b"DEVICE=C:\\HIMEMX.EXE", b"DEVICE=C:\\JEMM386.EXE"))
                     check("virtual-8086" in log, "JEMM386 is refused as V86: %r" % log.strip()[:60])
