@@ -63,8 +63,20 @@ const log = (...a) => console.log("[v86]", ...a);
 const t0 = Date.now();
 const elapsed = () => ((Date.now() - t0) / 1000).toFixed(0);
 const result = { os8088_up: false, mem_top: 0, ticks_moved: false, back: false };
+// V86_TYPE=1: the demo page's way in. Nothing runs by itself; wait for the prompt
+// banner, TYPE `dg b:`, and take DOS being back as the video leaving mode 12h for
+// text with the banner on the screen again (which is the screen restore, in v86)
+const TYPED = process.env.V86_TYPE === "1";
+const BANNER = "Type  DG B:";
 
 async function main() {
+    if (TYPED) {
+        while (Date.now() - t0 < 120000 && !screen().includes(BANNER)) await sleep(500);
+        log("prompt banner after", elapsed(), "s:", screen().includes(BANNER));
+        await sleep(1000);
+        emulator.keyboard_send_text("dg b:\n");
+        log("typed dg b:");
+    }
     // --- os8088 is up: graphics mode 12h in the BDA and a sane mem_top --------
     let up = false;
     while (Date.now() - t0 < 150000) {
@@ -97,7 +109,7 @@ async function main() {
     // --- DOS is back: its marker, in text -----------------------------------------
     while (Date.now() - t0 < 300000) {
         await sleep(1000);
-        if (screen().includes("DOSGUEST-BACK")) { result.back = true; break; }
+        if (TYPED ? (u8(0x449) === 0x03 && screen().includes(BANNER)) : screen().includes("DOSGUEST-BACK")) { result.back = true; break; }
     }
     log("DOS back:", result.back, "after", elapsed(), "s");
     await sleep(1500);

@@ -435,6 +435,30 @@ def v86_scenario(host):
                 check(g("mismatches") == 0 and g("ivt_mismatches") == 0,
                       "memory and the IVT came back under v86")
                 check(g("bootfail") == 0 and g("bootmode") == 1, "the boot sector loaded under v86")
+        # --- the DEMO directory, as a person uses it: nothing runs by itself, the
+        # prompt says what to type, and the screen they came from is back afterwards
+        dm = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "dosguest_demo.py")],
+                            capture_output=True, text=True, cwd=ROOT)
+        demo = os.path.join(ROOT, "build", "dosguest-demo")
+        if dm.returncode != 0:
+            print("  SKIP the demo directory: %s" % dm.stderr.strip()[-100:])
+        else:
+            hda2 = os.path.join(wd, "demo-hda.img")
+            shutil.copy(os.path.join(demo, "hda.img"), hda2)
+            out2 = os.path.join(wd, "demo-out.img")
+            print("the demo directory under v86: type DG B:, then System > Restart")
+            p = subprocess.run(["node", os.path.join(ROOT, "tests", "dosguest_v86.mjs"),
+                                os.path.join(demo, "boot.img"), os.path.join(demo, "os8088.img"), hda2,
+                                str(syms_["mem_top"]), str(syms_["ticks"]), out2],
+                               capture_output=True, text=True, timeout=420,
+                               env=dict(os.environ, V86_DIR=v86dir, V86_TYPE="1"))
+            print("  " + "\n  ".join(l for l in p.stdout.splitlines() if l.startswith(("[v86]", "RESULT"))))
+            check(p.returncode == 0,
+                  "typing DG B: at the demo's prompt runs os8088, and Restart returns to DOS with "
+                  "the banner back on the screen (exit %d)" % p.returncode)
+            r2 = read_result(out2) if os.path.exists(out2) else None
+            check(r2 is not None and r2.get("resumed") == "1" and int(r2["mismatches"], 16) == 0,
+                  "the demo's launcher report is clean")
     finally:
         shutil.rmtree(wd, ignore_errors=True)
 

@@ -80,6 +80,7 @@ chsonly     db 0                    ; /C: CHS only, never the extended calls (a 
 wflag       db 0                    ; /W: let os8088 WRITE (see wmask); the default is no unit
 wmask       db 0                    ; bit n = floppy n, bit 7 = any hard disk
 wtest       db 0                    ; /F: try a write through the live INT 13h (a test)
+verbose     db 0                    ; /V: print the report, not only write it
 t_snap      dw 0, 0                 ; seconds of the day at the snapshot, and after
 t_after     dw 0, 0
 tmp_h       db 0
@@ -126,6 +127,7 @@ msg_boot    db 'DG: the drive to boot os8088 from is a letter A: to Z:', 13, 10,
 msg_loc     db 'DG: cannot find that drive on the BIOS (is it a hard-disk volume DOS owns?)', 13, 10, '$'
 msg_v86     db 'DG: the CPU is in protected or virtual-8086 mode (EMM386, JEMM, QEMM, Windows)', 13, 10
             db '    os8088 needs the real machine. Boot without the memory manager.', 13, 10, '$'
+msg_back    db 'DG: DOS is back. The report is in \DGRESULT.TXT.', 13, 10, '$'
 msg_dos     db 'DG: needs DOS 3.0 or later', 13, 10, '$'
 msg_mem     db 'DG: cannot allocate the hidden block', 13, 10, '$'
 msg_swap    db 'DG: cannot write \DGSWAP.IMG', 13, 10, '$'
@@ -232,6 +234,11 @@ main:
     mov byte [wtest], 1
     jmp .cl
 .sw8:
+    cmp al, 'V'
+    jne .sw8b
+    mov byte [verbose], 1           ; /V: the whole report on the console as well
+    jmp .cl
+.sw8b:
     cmp al, 'C'
     jne .sw9
     mov byte [chsonly], 1
@@ -2033,12 +2040,20 @@ write_report:
     mov cx, si
     sub cx, rbuf
     mov [rlen], cx
-    ; console
+    ; the console: ONE line, unless /V. The report is forty lines and scrolls the
+    ; screen the user came from off the top of the one DOS has just given back
+    cmp byte [verbose], 0
+    je .brief
     mov bx, 1
     mov dx, rbuf
     mov ah, 0x40
     int 0x21
-    ; file
+    jmp .file
+.brief:
+    mov dx, msg_back
+    mov ah, 0x09
+    int 0x21
+.file:
     mov dx, resname
     xor cx, cx
     mov ah, 0x3C
