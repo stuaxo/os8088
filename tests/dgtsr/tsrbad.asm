@@ -1,8 +1,10 @@
 ; =============================================================================
 ; tests/dgtsr/tsrbad.asm - a TSR dosguest must REFUSE (tests/dosguest.py)
 ;
-; A plain hook with no way to see the previous owner through it: nothing for
-; the launcher's unwrapping to recognise. The vector is -DVEC=<n>, INT 08h by
+; A hook with no way to see the previous owner through it: no sharing header,
+; no `call` wrapper, and a chain the launcher's scan for `jmp far cs:[old]` and
+; `call far cs:[old]` cannot find (it returns to the old vector through the
+; stack). A plain `jmp far` hook IS accepted now - see tsrok.asm and the scan. The vector is -DVEC=<n>, INT 08h by
 ; default. A launcher that handed os8088 this vector would have it chain into
 ; memory it had just overwritten, so the right answer is to say no, name the
 ; vector and where it points, and touch nothing.
@@ -18,7 +20,11 @@ old     dd 0
 cnt     dw 0
 h:
     inc word [cs:cnt]
-    jmp far [cs:old]
+    ; chain by pushing the old vector and returning to it: it works, and there is
+    ; no jmp or call through a variable for the launcher's scan to find
+    push word [cs:old+2]
+    push word [cs:old]
+    retf
 init:
     mov ax, 0x3500 | VEC
     int 0x21

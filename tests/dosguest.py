@@ -168,7 +168,7 @@ def run_guest(work, ram_mb, defs=(), secs=120):
     return res, data
 
 
-def dos_session(work, auto_lines, files=(), secs=90):
+def dos_session(work, auto_lines, files=(), secs=90, cfg_extra=()):
     """Boot FreeDOS, run AUTO_LINES from C:, power off. Returns (log, data.img)."""
     com = os.path.join(work, "DG.COM")
     sh("nasm", "-w+error", "-f", "bin", "-o", com, os.path.join(ROOT, "dosguest", "dg.asm"))
@@ -176,7 +176,8 @@ def dos_session(work, auto_lines, files=(), secs=90):
     shutil.copy(getfreedos.IMG, boot)
     cfg, auto = os.path.join(work, "cfg"), os.path.join(work, "auto")
     with open(cfg, "wb") as f:
-        f.write(b"SHELL=\\FREEDOS\\BIN\\COMMAND.COM \\FREEDOS\\BIN /E:2048 /P=\\FDAUTO.BAT\r\n")
+        f.write(b"".join(l + b"\r\n" for l in cfg_extra) +
+                b"SHELL=\\FREEDOS\\BIN\\COMMAND.COM \\FREEDOS\\BIN /E:2048 /P=\\FDAUTO.BAT\r\n")
     with open(auto, "wb") as f:
         f.write(b"@echo off\r\nc:\r\n" + b"".join(l + b"\r\n" for l in auto_lines) +
                 b"a:\\freedos\\bin\\fdapm poweroff\r\n")
@@ -233,7 +234,7 @@ def text_screen(sock, base=0xB8000, cols=80, rows=50):
     return [bytes(chars[r * cols:(r + 1) * cols]).decode("latin1").rstrip() for r in range(rows)]
 
 
-def run_boot(work, os_img, auto_lines=None, files=()):
+def run_boot(work, os_img, auto_lines=None, files=(), cfg_extra=()):
     """Wave 2: `DG B:` with os8088 in B:, Restart by the mouse, DOS back."""
     com = os.path.join(work, "DG.COM")
     sh("nasm", "-w+error", "-f", "bin", "-o", com, os.path.join(ROOT, "dosguest", "dg.asm"))
@@ -243,7 +244,8 @@ def run_boot(work, os_img, auto_lines=None, files=()):
     shutil.copy(os_img, osd)
     cfg, auto = os.path.join(work, "cfg"), os.path.join(work, "auto")
     with open(cfg, "wb") as f:
-        f.write(b"SHELL=\\FREEDOS\\BIN\\COMMAND.COM \\FREEDOS\\BIN /E:2048 /P=\\FDAUTO.BAT\r\n")
+        f.write(b"".join(l + b"\r\n" for l in cfg_extra) +
+                b"SHELL=\\FREEDOS\\BIN\\COMMAND.COM \\FREEDOS\\BIN /E:2048 /P=\\FDAUTO.BAT\r\n")
     # no poweroff: the harness reads the screen first. `dir` and `ver` after the
     # launcher prove DOS's file layer and its own state came back, not only RAM
     if auto_lines is None:
@@ -295,6 +297,22 @@ def run_boot(work, os_img, auto_lines=None, files=()):
         check("mem_top" in info, "os8088 reached a desktop under DOS (mem_top %s)"
               % (hex(info["mem_top"]) if "mem_top" in info else "never read"))
         if "mem_top" not in info:
+            if os.environ.get("DG_SHOT"):        # a picture of where it stopped
+                subprocess.run([sys.executable, os.path.join(ROOT, "tools", "shot.py"), sock,
+                                os.environ["DG_SHOT"]], capture_output=True, cwd=ROOT)
+                with open(os.environ["DG_SHOT"] + ".regs", "w") as f:
+                    regs = hmp(sock, "info registers")
+                    f.write(regs)
+                    m = re.search(r"EIP=([0-9a-f]+).*?CS =([0-9a-f]+)", regs, re.S)
+                    if m:
+                        lin = int(m.group(2), 16) * 16 + int(m.group(1), 16)
+                        f.write(hmp(sock, "x /24i 0x%x" % (lin - 24)))
+                        f.write(hmp(sock, "xp /32xb 0x%x" % (lin - 16)))
+                        for name, addr, n in (("stage2 start 98180", 0x98180, 32), ("kernel 600", 0x600, 32),
+                                              ("top sector 9BE00", 0x9BE00, 48), ("BDA 413", 0x413, 4),
+                                              ("IVT 0..0x80", 0, 128)):
+                            f.write("== %s\n" % name)
+                            f.write(hmp(sock, "xp /%dxb 0x%x" % (n, addr)))
             return None, data, info
         tk = peek16(sock, syms["ticks"])
         time.sleep(3)
@@ -531,6 +549,79 @@ def main():
                     shutil.rmtree(wd, ignore_errors=True)
         finally:
             shutil.rmtree(tw, ignore_errors=True)
+
+        # --- REAL DRIVERS, from the FreeDOS repository ---------------------
+        # A toy TSR proves what its author thought of. These are somebody else's.
+        if not getfreedos.have_pkgs():
+            print("  SKIP real drivers: python3 tools/getfreedos.py --pkgs")
+        else:
+            pk = lambda n, m: getfreedos.pkg_path(n, m)
+            HM, CT = pk("himemx", "BIN/HimemX.exe"), pk("ctmouse", "BIN/CTMOUSE.EXE")
+            aw = tempfile.mkdtemp(prefix="dosguest-drv-")
+            try:
+                dq = os.path.join(aw, "drvq.com")
+                sh("nasm", "-w+error", "-f", "bin", "-o", dq, os.path.join(ROOT, "tests", "dgtsr", "drvq.asm"))
+                aq = os.path.join(aw, "a20q.com")
+                sh("nasm", "-w+error", "-f", "bin", "-o", aq, os.path.join(ROOT, "tests", "dgtsr", "a20q.asm"))
+                if os.path.exists(os_img):
+                    print("real drivers through os8088: HIMEMX (XMS, hooks INT 15h) and CTMOUSE (hooks INT 10h)")
+                    wd = tempfile.mkdtemp(prefix="dosguest-real-")
+                    try:
+                        back, d, info = run_boot(
+                            wd, os_img,
+                            auto_lines=[b"ctmouse", b"drvq > c:\\d0.txt", b"a20q > c:\\a0.txt",
+                                        b"dg /k b: > c:\\log.txt",
+                                        b"drvq > c:\\d1.txt", b"a20q > c:\\a1.txt"],
+                            files=[CT, HM, dq, aq], cfg_extra=[b"DEVICE=C:\\HIMEMX.EXE"])
+                        rr = read_result(d) if back else None
+                        check(rr is not None and rr.get("resumed") == "1",
+                              "DG accepted HIMEMX and CTMOUSE, booted os8088 and resumed")
+                        if rr is not None:
+                            g = lambda k: int(rr[k], 16)
+                            t = lambda f: subprocess.run(["mtype", "-i", d, "::" + f],
+                                                         capture_output=True).stdout.decode().strip()
+                            d0, d1, a0, a1 = t("D0.TXT"), t("D1.TXT"), t("A0.TXT"), t("A1.TXT")
+                            print("  drivers before: %s   after: %s   A20: %s -> %s" % (d0, d1, a0, a1))
+                            check(d0.startswith("80 0300") and d0.endswith("FFFF"),
+                                  "CONTROL: the probe sees an XMS 3.00 driver and a mouse driver (%s)" % d0)
+                            check(d1 == d0, "XMS (version, free memory, A20) and the mouse driver are "
+                                  "the same after os8088: nothing the image does not cover was lost")
+                            check(a0 == "1" and a1 == "1", "A20 is on before and after")
+                            check(g("heuristic_unwraps") >= 2,
+                                  "the INT 15h and INT 10h hooks were unwrapped by the scan (%d)" % g("heuristic_unwraps"))
+                            check(g("mismatches") == 0 and g("ivt_mismatches") == 0,
+                                  "memory and the IVT came back with both resident")
+                    finally:
+                        shutil.rmtree(wd, ignore_errors=True)
+                print("real drivers that must be accepted (the launcher alone):")
+                for name, files, cfg, lines in (
+                        ("SHARE", [pk("share", "BIN/SHARE.COM")], (), [b"share"]),
+                        ("NANSI.SYS", [pk("nansi", "BIN/NANSI.SYS")], (b"DEVICE=C:\\NANSI.SYS",), []),
+                        ("KEYB", [pk("keyb", "BIN/KEYB.EXE")], (), [b"keyb us"]),
+                        ("LBACACHE on XMS", [HM, pk("lbacache", "BIN/LBACACHE.COM")],
+                         (b"DEVICE=C:\\HIMEMX.EXE",), [b"lbacache"])):
+                    wd = tempfile.mkdtemp(prefix="dosguest-acc-")
+                    try:
+                        log, d = dos_session(wd, lines + [b"dg /k > c:\\log.txt"], files=files, cfg_extra=cfg)
+                        ra = read_result(d)
+                        check(ra is not None and ra.get("resumed") == "1" and int(ra["mismatches"], 16) == 0,
+                              "%s is accepted and DOS comes back" % name)
+                    finally:
+                        shutil.rmtree(wd, ignore_errors=True)
+                print("a memory manager that puts DOS in virtual-8086 mode must be refused:")
+                wd = tempfile.mkdtemp(prefix="dosguest-v86-")
+                try:
+                    log, d = dos_session(wd, [b"dg > c:\\log.txt", b"echo ALIVE > c:\\alive.txt"],
+                                         files=[HM, pk("jemm", "BIN/JEMM386.EXE")],
+                                         cfg_extra=(b"DEVICE=C:\\HIMEMX.EXE", b"DEVICE=C:\\JEMM386.EXE"))
+                    check("virtual-8086" in log, "JEMM386 is refused as V86: %r" % log.strip()[:60])
+                    check(subprocess.run(["mtype", "-i", d, "::ALIVE.TXT"], capture_output=True).returncode == 0
+                          and subprocess.run(["mtype", "-i", d, "::DGSWAP.IMG"], capture_output=True).returncode != 0,
+                          "and DOS carries on with nothing written")
+                finally:
+                    shutil.rmtree(wd, ignore_errors=True)
+            finally:
+                shutil.rmtree(aw, ignore_errors=True)
 
         # THE GUEST'S OWN NEGATIVE CONTROL: the same launcher with the restore
         # left out. The trash then wipes the launcher itself, so the honest

@@ -108,6 +108,8 @@ resname     db '\DGRESULT.TXT', 0
 dirname     db 'DGSWAP  IMG'
 
 msg_boot    db 'DG: wave 2 boots os8088 from a floppy only: DG A: or DG B:', 13, 10, '$'
+msg_v86     db 'DG: the CPU is in protected or virtual-8086 mode (EMM386, JEMM, QEMM, Windows)', 13, 10
+            db '    os8088 needs the real machine. Boot without the memory manager.', 13, 10, '$'
 msg_dos     db 'DG: needs DOS 3.31 or later', 13, 10, '$'
 msg_mem     db 'DG: cannot allocate the hidden block', 13, 10, '$'
 msg_swap    db 'DG: cannot write \DGSWAP.IMG', 13, 10, '$'
@@ -195,6 +197,7 @@ main:
 .dosok:
     int 0x12
     mov [total_kb], ax
+    call check_real_mode
     MARK 'a'
     ; --- the hidden block, from the top of the arena ------------------------
     mov ax, 0x5801
@@ -384,6 +387,7 @@ cl_i0e      dw 0
 cl_i76      dw 0
 vec_cur     dw 0
 cls_cur     db 0
+heur_n      dw 0                    ; vectors unwrapped by the heuristic, reported
 
 build_clean:
     xor si, si                      ; into vec_tab, two bytes an entry
@@ -418,9 +422,17 @@ build_clean:
     jmp .again
 .notiisp:
     cmp byte [es:bx], 0xE8
-    jne .nope
+    jne .heur
     mov ax, [es:bx+3]
     mov dx, [es:bx+5]
+    jmp .again
+.heur:
+    ; Not a shape that says where the old vector is. Most TSRs chain with a far
+    ; jump or call through a variable in their own segment, so look for one whose
+    ; target is in ROM. ES:BX is the handler.
+    call scan_chain                 ; AX:DX <- the old vector, CF if none found
+    jc .nope
+    inc word [heur_n]
 .again:
     loop .chase
 .nope:
@@ -459,6 +471,83 @@ build_clean:
     jmp .l
 .done:
     push cs
+    pop es
+    ret
+
+; scan_chain: ES:BX = a handler in RAM. Look in its first 128 bytes for
+;     2E FF 2E w   jmp far cs:[w]        2E FF 1E w   call far cs:[w]
+;     EA o o s s   jmp far s:o
+; and take the far pointer if it names ROM (segment C000 or above), which is the
+; one thing that makes it believable: a variable in a TSR's own data holding a
+; ROM address is the old vector. Returns AX:DX = offset:segment, CF if none.
+; HEURISTIC, and counted in [heur_n] so a run says how many vectors rested on it.
+scan_chain:
+    push cx
+    push si
+    mov si, bx
+    mov cx, 128
+.s: cmp byte [es:si], 0x2E
+    jne .ea
+    cmp byte [es:si+1], 0xFF
+    jne .ea
+    mov al, [es:si+2]
+    cmp al, 0x2E
+    je .mem
+    cmp al, 0x1E
+    jne .ea
+.mem:
+    push bx
+    mov bx, [es:si+3]               ; the variable, in the handler's own segment
+    mov ax, [es:bx]
+    mov dx, [es:bx+2]
+    pop bx
+    cmp dx, 0xC000
+    jb .ea
+    call plausible
+    jnc .found
+.ea:
+    cmp byte [es:si], 0xEA
+    jne .nx
+    mov dx, [es:si+3+2]
+    cmp dx, 0xC000
+    jb .nx
+    mov ax, [es:si+3]
+    call plausible
+    jnc .found
+.nx:
+    inc si
+    loop .s
+    stc
+    jmp .out
+.found:
+    clc
+.out:
+    pop si
+    pop cx
+    ret
+
+; plausible: DX:AX = a far pointer into the ROM area. CF set if what is there
+; cannot be a handler's first instruction: unmapped ROM space reads FF, unused
+; memory 00, and a first instruction is neither. Without this the scan took four
+; bytes of an XMS driver's own code (00 F0 33 C0, `add al,dh; xor ax,ax`) for a
+; ROM vector, and os8088 called into nothing.
+plausible:
+    push es
+    push bx
+    mov es, dx
+    mov bx, ax
+    mov bl, [es:bx]
+    mov bh, bl                      ; the first byte, twice
+    cmp bl, 0xFF
+    je .no
+    test bl, bl
+    jz .no
+    clc
+    jmp .out
+.no:
+    stc
+.out:
+    pop bx
     pop es
     ret
 
@@ -512,6 +601,34 @@ con_nib:
     mov ah, 2
     int 0x21
     ret
+
+; =============================================================================
+; check_real_mode: refuse under a memory manager that put DOS in virtual-8086
+; mode (EMM386, JEMM, QEMM) or under Windows. os8088 takes the machine over, and
+; the stub does raw port I/O and boots a real-mode OS: none of that is the real
+; machine's. `smsw` is a 286 instruction, so an 8086 or 186 has to be told apart
+; first, by the flags: on those, bits 15 to 12 cannot be cleared. (And on those
+; there is no V86 to be in.)
+; =============================================================================
+check_real_mode:
+    pushf
+    pop ax
+    and ax, 0x0FFF
+    push ax
+    popf
+    pushf
+    pop ax
+    and ax, 0xF000
+    cmp ax, 0xF000
+    je .real                        ; 8086/186: the high flag bits stick at 1
+    db 0x0F, 0x01, 0xE0             ; smsw ax (a 286 opcode, written out)
+    test al, 1                      ; PE: protected mode, which for DOS means V86
+    jnz .v86
+.real:
+    ret
+.v86:
+    mov dx, msg_v86
+    jmp fail
 
 ; =============================================================================
 ; install_stub: copy the stub into the hidden block and fill its constants
@@ -1334,6 +1451,11 @@ report:                             ; ES = the block
     mov ax, [es:blk_clcnt]
     call emit_hex16
     call emit_crlf
+    mov si, r_heur
+    call emit_str
+    mov ax, [heur_n]
+    call emit_hex16
+    call emit_crlf
     mov si, r_unit
     call emit_str
     mov al, [es:blk_unit]
@@ -1436,6 +1558,7 @@ r_unit   db 'unit=', 0
 r_ivt    db 'ivt_mismatches=', 0
 r_c08    db 'clean_int08=', 0
 r_cn     db 'clean_vectors=', 0
+r_heur   db 'heuristic_unwraps=', 0
 r_nruns  db 'nruns=', 0
 r_tsnap  db 'dos_secs_snap=', 0
 r_taft   db 'dos_secs_after=', 0
