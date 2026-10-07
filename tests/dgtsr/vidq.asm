@@ -125,6 +125,25 @@ org 0x100
     call putc
     pop cx
     loop .t
+    call sp_
+    ; the top left of the text page: B800, or B000 in mode 7
+    mov ah, 0x0F
+    int 0x10
+    mov bx, 0xB800
+    cmp al, 7
+    jne .t0
+    mov bx, 0xB000
+.t0:
+    mov es, bx
+    xor si, si
+    mov cx, 8
+.t1:
+    mov al, [es:si]
+    add si, 2
+    push cx
+    call putc
+    pop cx
+    loop .t1
     mov al, 13
     call putc
     mov al, 10

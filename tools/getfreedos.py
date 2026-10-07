@@ -3,6 +3,7 @@
 
     python3 tools/getfreedos.py              # fetch + verify + extract the boot floppy
     python3 tools/getfreedos.py --pkgs       # ...and the real drivers tests/dosguest.py loads
+    python3 tools/getfreedos.py --svardos    # ...and SvarDOS, a second DOS (Enhanced DR-DOS kernel)
     python3 tools/getfreedos.py --check      # verify what is there, never fetch
 
 **Nothing this script downloads is committed.** FreeDOS is somebody else's
@@ -54,6 +55,48 @@ PKGS = {                              # name -> (sha256 of the zip, members kept
     "lbacache": ("21ca3fa717e6c6f3bc705869a4b84ffcc58ef5ca7929d8a57bb2c932afbe6ae0", ("BIN/LBACACHE.COM",)),
 }
 PKGDIR = os.path.join(OUT, "pkgs")
+
+# SvarDOS: its kernel is Enhanced DR-DOS (a DR-DOS, not a FreeDOS), which is the
+# point - a second DOS family. Over plain HTTP because its site has no TLS.
+SVAR_DIR = os.path.join(ROOT, "build", "svardos")
+SVAR_URL = "http://svardos.org/download/20250427/svardos-20250427-floppy-1.44M.zip"
+SVAR_ZIP_SHA256 = "3a648ab160167d0e5cc96db35d3bef487c5995a9da93f1262be02ec5c1aca6dd"
+SVAR_MEMBER = "svdos-1.44M-disk-1.img"
+SVAR_IMG = os.path.join(SVAR_DIR, "boot.img")
+SVAR_IMG_SHA256 = "4db7fcab7388909d8e1d1cd4433f30d96cf3740ae363c889243e9f39bcdccda5"
+
+
+def have_svardos():
+    return os.path.exists(SVAR_IMG) and sha256(SVAR_IMG) == SVAR_IMG_SHA256
+
+
+def fetch_svardos():
+    dl = os.path.join(SVAR_DIR, "dl")
+    os.makedirs(dl, exist_ok=True)
+    zpath = os.path.join(dl, "svardos-floppy.zip")
+    if not (os.path.exists(zpath) and sha256(zpath) == SVAR_ZIP_SHA256):
+        print("getfreedos: fetching %s" % SVAR_URL)
+        tmp = zpath + ".part"
+        for attempt in range(4):
+            try:
+                with urllib.request.urlopen(SVAR_URL, timeout=60) as r, open(tmp, "wb") as f:
+                    f.write(r.read())
+                break
+            except (urllib.error.URLError, OSError) as e:
+                if attempt == 3:
+                    raise
+                print("getfreedos: svardos: %s, retrying" % e)
+                time.sleep(10 * (attempt + 1))
+        if sha256(tmp) != SVAR_ZIP_SHA256:
+            os.unlink(tmp)
+            sys.exit("getfreedos: the SvarDOS archive does not match its pin")
+        os.replace(tmp, zpath)
+    with zipfile.ZipFile(zpath) as z:
+        data = z.read(SVAR_MEMBER)
+    with open(SVAR_IMG, "wb") as f:
+        f.write(data)
+    if sha256(SVAR_IMG) != SVAR_IMG_SHA256:
+        sys.exit("getfreedos: the extracted SvarDOS floppy does not match its pin")
 
 
 def pkg_path(name, member):
@@ -144,6 +187,10 @@ def main():
     if "--pkgs" in sys.argv:
         fetch_pkgs()
         print("getfreedos: %d packages in %s" % (len(PKGS), PKGDIR))
+    if "--svardos" in sys.argv:
+        if not have_svardos():
+            fetch_svardos()
+        print("getfreedos: %s" % SVAR_IMG)
     return 0
 
 

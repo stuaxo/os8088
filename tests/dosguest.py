@@ -98,6 +98,38 @@ def sh(*a, **k):
     return subprocess.run(a, check=True, capture_output=True, **k)
 
 
+class Host:
+    """A DOS to boot: its floppy, and the names it reads its configuration under."""
+
+    def __init__(self, name, img, cfg_name, shell, auto_name, poweroff, banner, ver, base_cfg=b""):
+        self.banner, self.ver = banner, ver
+        self.name, self.img, self.cfg_name = name, img, cfg_name
+        self.shell, self.auto_name, self.poweroff, self.base_cfg = shell, auto_name, poweroff, base_cfg
+
+    def boot_image(self, work, body, cfg_extra=(), power=True):
+        """A copy of the floppy with OUR config and autoexec: BODY is the batch lines."""
+        boot = os.path.join(work, "boot.img")
+        shutil.copy(self.img, boot)
+        cfg, auto = os.path.join(work, "cfg"), os.path.join(work, "auto")
+        with open(cfg, "wb") as f:
+            f.write(self.base_cfg + b"".join(l + b"\r\n" for l in cfg_extra) + self.shell + b"\r\n")
+        with open(auto, "wb") as f:
+            f.write(b"@echo off\r\nc:\r\n" + b"".join(l + b"\r\n" for l in body) +
+                    (self.poweroff + b"\r\n" if power else b""))
+        sh("mcopy", "-o", "-i", boot, cfg, "::" + self.cfg_name)
+        sh("mcopy", "-o", "-i", boot, auto, "::" + self.auto_name)
+        return boot
+
+
+FREEDOS = Host("FreeDOS 1.4", getfreedos.IMG, "FDCONFIG.SYS",
+               b"SHELL=\\FREEDOS\\BIN\\COMMAND.COM \\FREEDOS\\BIN /E:2048 /P=\\FDAUTO.BAT",
+               "FDAUTO.BAT", b"a:\\freedos\\bin\\fdapm poweroff", "FreeCom version", "FreeCom")
+SVARDOS = Host("SvarDOS 20250427 (Enhanced DR-DOS kernel)", getfreedos.SVAR_IMG, "CONFIG.SYS",
+               b"SHELL=COMMAND.COM /e:512 /p", "AUTOEXEC.BAT", b"a:\\fdapm poweroff", "Enhanced DR-DOS kernel", "DR-DOS",
+               base_cfg=b"LASTDRIVE=Z\r\nFILES=30\r\nBUFFERS=20\r\n")
+HOST = FREEDOS                        # the DOS the current pass is booting
+
+
 def read_result(data):
     txt = subprocess.run(["mtype", "-i", data, "::DGRESULT.TXT"], capture_output=True)
     if txt.returncode:
@@ -115,23 +147,12 @@ def read_result(data):
     return res
 
 
-def run_guest(work, ram_mb, defs=(), secs=120):
+def run_guest(work, ram_mb, defs=(), secs=120, flags=b""):
     """Boot FreeDOS with DG.COM on C:, return (result dict, data.img path)."""
     com = os.path.join(work, "DG.COM")
     sh("nasm", "-w+error", *defs, "-f", "bin", "-o", com,
        os.path.join(ROOT, "dosguest", "dg.asm"))
-    boot = os.path.join(work, "boot.img")
-    shutil.copy(getfreedos.IMG, boot)
-    cfg = os.path.join(work, "cfg")
-    auto = os.path.join(work, "auto")
-    with open(cfg, "wb") as f:
-        f.write(b"SHELL=\\FREEDOS\\BIN\\COMMAND.COM \\FREEDOS\\BIN /E:2048 "
-                b"/P=\\FDAUTO.BAT\r\n")
-    with open(auto, "wb") as f:
-        f.write(b"@echo off\r\nc:\r\ndg /k > c:\\log.txt\r\n"
-                b"a:\\freedos\\bin\\fdapm poweroff\r\n")
-    sh("mcopy", "-o", "-i", boot, cfg, "::FDCONFIG.SYS")
-    sh("mcopy", "-o", "-i", boot, auto, "::FDAUTO.BAT")
+    boot = HOST.boot_image(work, [b"dg /k " + flags + b" > c:\\log.txt"])
     data = os.path.join(work, "data.img")
     sh("mformat", "-C", "-T", "16384", "-h", "16", "-s", "63", "-i", data, "::")
     sh("mcopy", "-o", "-i", data, com, "::DG.COM")
@@ -172,17 +193,7 @@ def dos_session(work, auto_lines, files=(), secs=90, cfg_extra=()):
     """Boot FreeDOS, run AUTO_LINES from C:, power off. Returns (log, data.img)."""
     com = os.path.join(work, "DG.COM")
     sh("nasm", "-w+error", "-f", "bin", "-o", com, os.path.join(ROOT, "dosguest", "dg.asm"))
-    boot = os.path.join(work, "boot.img")
-    shutil.copy(getfreedos.IMG, boot)
-    cfg, auto = os.path.join(work, "cfg"), os.path.join(work, "auto")
-    with open(cfg, "wb") as f:
-        f.write(b"".join(l + b"\r\n" for l in cfg_extra) +
-                b"SHELL=\\FREEDOS\\BIN\\COMMAND.COM \\FREEDOS\\BIN /E:2048 /P=\\FDAUTO.BAT\r\n")
-    with open(auto, "wb") as f:
-        f.write(b"@echo off\r\nc:\r\n" + b"".join(l + b"\r\n" for l in auto_lines) +
-                b"a:\\freedos\\bin\\fdapm poweroff\r\n")
-    sh("mcopy", "-o", "-i", boot, cfg, "::FDCONFIG.SYS")
-    sh("mcopy", "-o", "-i", boot, auto, "::FDAUTO.BAT")
+    boot = HOST.boot_image(work, auto_lines, cfg_extra)
     data = os.path.join(work, "data.img")
     sh("mformat", "-C", "-T", "16384", "-h", "16", "-s", "63", "-i", data, "::")
     sh("mcopy", "-o", "-i", data, com, "::DG.COM")
@@ -223,39 +234,33 @@ def peek16(sock, lin):
     return None
 
 
-def text_screen(sock, base=0xB8000, cols=80, rows=50):
-    """The text screen as a list of strings, read out of video RAM."""
-    out = hmp(sock, "xp /%dxb 0x%x" % (cols * rows * 2, base))   # 80x50 is the most a host is in
-    b = bytearray()
-    for line in out.splitlines():
-        if ":" in line:
-            b += bytes(int(x, 16) for x in line.split(":", 1)[1].split() if x.startswith("0x"))
-    chars = b[0::2]
-    return [bytes(chars[r * cols:(r + 1) * cols]).decode("latin1").rstrip() for r in range(rows)]
+def text_screen(sock, cols=80, rows=50):
+    """The text screen as a list of strings, read out of video RAM. Both text
+    pages: a mono host (mode 7) is at B0000 and the rest at B8000."""
+    lines = []
+    for base in (0xB8000, 0xB0000):
+        out = hmp(sock, "xp /%dxb 0x%x" % (cols * rows * 2, base))
+        b = bytearray()
+        for line in out.splitlines():
+            if ":" in line:
+                b += bytes(int(x, 16) for x in line.split(":", 1)[1].split() if x.startswith("0x"))
+        chars = b[0::2]
+        lines += [bytes(chars[r * cols:(r + 1) * cols]).decode("latin1").rstrip() for r in range(rows)]
+    return lines
 
 
 def run_boot(work, os_img, auto_lines=None, files=(), cfg_extra=(), during=None):
     """Wave 2: `DG B:` with os8088 in B:, Restart by the mouse, DOS back."""
     com = os.path.join(work, "DG.COM")
     sh("nasm", "-w+error", "-f", "bin", "-o", com, os.path.join(ROOT, "dosguest", "dg.asm"))
-    boot = os.path.join(work, "boot.img")
-    shutil.copy(getfreedos.IMG, boot)
     osd = os.path.join(work, "os8088.img")
     shutil.copy(os_img, osd)
-    cfg, auto = os.path.join(work, "cfg"), os.path.join(work, "auto")
-    with open(cfg, "wb") as f:
-        f.write(b"".join(l + b"\r\n" for l in cfg_extra) +
-                b"SHELL=\\FREEDOS\\BIN\\COMMAND.COM \\FREEDOS\\BIN /E:2048 /P=\\FDAUTO.BAT\r\n")
     # no poweroff: the harness reads the screen first. `dir` and `ver` after the
     # launcher prove DOS's file layer and its own state came back, not only RAM
     if auto_lines is None:
         auto_lines = [b"dg /k b: > c:\\log.txt"]
-    with open(auto, "wb") as f:
-        f.write(b"@echo off\r\nc:\r\n" + b"".join(l + b"\r\n" for l in auto_lines) +
-                b"dir c:\\ > c:\\after.txt\r\nver >> c:\\after.txt\r\n"
-                b"echo DOSGUEST-BACK\r\n")
-    sh("mcopy", "-o", "-i", boot, cfg, "::FDCONFIG.SYS")
-    sh("mcopy", "-o", "-i", boot, auto, "::FDAUTO.BAT")
+    boot = HOST.boot_image(work, auto_lines + [b"dir c:\\ > c:\\after.txt", b"ver >> c:\\after.txt",
+                                               b"echo DOSGUEST-BACK"], cfg_extra, power=False)
     data = os.path.join(work, "data.img")
     sh("mformat", "-C", "-T", "16384", "-h", "16", "-s", "63", "-i", data, "::")
     sh("mcopy", "-o", "-i", data, com, "::DG.COM")
@@ -356,21 +361,14 @@ def run_boot(work, os_img, auto_lines=None, files=(), cfg_extra=(), during=None)
     return back, data, info
 
 
-def main():
-    for tool in ("nasm", "qemu-system-i386", "mcopy", "mformat", "mtype"):
-        if not shutil.which(tool):
-            print("dosguest: SKIP, no %s" % tool)
-            return 0
-    if not getfreedos.have():
-        print("dosguest: SKIP, no FreeDOS (python3 tools/getfreedos.py)")
-        return 0
-    dgfat.selfcheck()
+def scenarios(host):
+    """Everything, against one DOS."""
     work = tempfile.mkdtemp(prefix="dosguest-")
     try:
         res, data = run_guest(work, 8)
         check(res is not None, "the guest wrote \\DGRESULT.TXT")
         if res is None:
-            return 1
+            return
         h = lambda k: int(res[k], 16)
         print("  guest: %s" % {k: v for k, v in res.items() if k != "runs"})
         check(res.get("resumed") == "1", "the guest resumed")
@@ -400,9 +398,13 @@ def main():
               "the snapshot holds the ORIGINAL memory size (%d KB), not the lowered" % bda)
         v08 = int.from_bytes(swap[0x20:0x22], "little") | \
             int.from_bytes(swap[0x22:0x24], "little") << 16
-        check(v08 >> 16 < 0xC000,
-              "the snapshot holds DOS's INT 08h (%04X:%04X), not the clean one"
-              % (v08 >> 16, v08 & 0xFFFF))
+        if host is FREEDOS:               # FreeDOS wraps INT 08h in RAM; the DR-DOS kernel leaves the ROM's
+            check(v08 >> 16 < 0xC000,
+                  "the snapshot holds DOS's INT 08h (%04X:%04X), not the clean one"
+                  % (v08 >> 16, v08 & 0xFFFF))
+        else:
+            print("  note: this DOS leaves INT 08h in the ROM (%04X:%04X), so there is no hook to find"
+                  % (v08 >> 16, v08 & 0xFFFF))
 
         # --- negative controls ---------------------------------------------
         bad = bytearray(swap)
@@ -445,11 +447,11 @@ def main():
                     check(g("ivt_mismatches") == 0, "DOS's vectors came back (IVT)")
                     check(g("int12_after") == g("orig_kb"), "int 12h is the original size again")
                     scr = info["screen"]
-                    check(any("FreeCom version" in ln for ln in scr),
-                          "the DOS screen from BEFORE the launcher is back (FreeCom banner)")
+                    check(any(host.banner in ln for ln in scr),
+                          "the DOS screen from BEFORE the launcher is back (%r)" % host.banner)
                     after = subprocess.run(["mtype", "-i", data2, "::AFTER.TXT"], capture_output=True)
                     atxt = after.stdout.decode("latin1")
-                    check("DG" in atxt and "DGSWAP" in atxt and "FreeCom" in atxt,
+                    check("DG" in atxt and "DGSWAP" in atxt and host.ver in atxt,
                           "DOS's file layer works after the resume (dir and ver ran)")
                     # the swap file is os8088-time evidence too: it must hold the pattern
                     img2 = open(data2, "rb").read()
@@ -562,6 +564,78 @@ def main():
         finally:
             shutil.rmtree(tw, ignore_errors=True)
 
+        # --- os8088 may not write what DOS can see ----------------------------
+        # os8088 reaches its disks through INT 13h, and the launcher hands it one
+        # that refuses writes. The test goes through the LIVE vector with the
+        # extended write, at a sector of the swap file's video area that nothing
+        # uses, so a write that gets through is harmless and shows on the host.
+        for flags, blocked, what in ((b"/f", True, "by default a write through os8088's INT 13h is REFUSED (write protected)"),
+                                     (b"/f /w", True, "a bare /W allows the os8088 boot floppy only: a hard-disk write is still refused"),
+                                     (b"/f /wh", False, "/WH allows hard disks: the same write goes through"),
+                                     (b"/f /w*", False, "CONTROL: with /W* the same write goes through")):
+            wd = tempfile.mkdtemp(prefix="dosguest-wp-")
+            try:
+                rw_, dw_ = run_guest(wd, 8, flags=flags)
+                if rw_ is None:
+                    check(False, what)
+                    continue
+                ah_cf_mask = rw_["wtest_ah_cf_wmask"]
+                ah, cf = int(ah_cf_mask[0:2], 16), int(ah_cf_mask[2:4], 16)
+                vol = dgfat.Volume(open(dw_, "rb").read())
+                swp = vol.read(b"DGSWAP  IMG")
+                off = (int(rw_["size_kb"], 16) * 2 + 40) * 512
+                landed = swp[off:off + 4] == b"GDGD"
+                if blocked:
+                    check(cf == 1 and ah == 3 and not landed,
+                          "%s (AH=%02X CF=%d, and the sector %s)" % (what, ah, cf, "was written" if landed else "is untouched"))
+                else:
+                    check(cf == 0 and landed, "%s (CF=%d, and the sector %s)" % (what, cf, "holds the marker" if landed else "is NOT written"))
+            finally:
+                shutil.rmtree(wd, ignore_errors=True)
+
+        # --- every video mode a DOS can be in -----------------------------------
+        # Text modes (0 to 3, 7) come back as themselves, marker and all; a
+        # graphics mode cannot be restored and the host must come back in 80x25
+        # TEXT - not in a graphics mode with nothing on it, and not in some
+        # third thing. Mode 3 and the 80x50 font case are covered above.
+        if os.path.exists(os_img):
+            mw = tempfile.mkdtemp(prefix="dosguest-modes-")
+            try:
+                vm, vq = os.path.join(mw, "vidmode.com"), os.path.join(mw, "vidq.com")
+                for nm, out in (("vidmode", vm), ("vidq", vq)):
+                    sh("nasm", "-w+error", "-f", "bin", "-o", out,
+                       os.path.join(ROOT, "tests", "dgtsr", nm + ".asm"))
+                print("video modes: text modes return as themselves, graphics modes as 80x25 text")
+                for mode, kind in (("0", "40x25 grey-scale text"), ("1", "40x25 text"), ("2", "80x25 grey-scale text"),
+                                   ("7", "MDA-style mono text (B000)"),
+                                   ("4", "CGA 320x200 graphics"), ("D", "EGA 320x200 graphics"),
+                                   ("12", "VGA 640x480 graphics"), ("13", "VGA 320x200x256")):
+                    wd = tempfile.mkdtemp(prefix="dosguest-mode-")
+                    try:
+                        back, d, info = run_boot(
+                            wd, os_img,
+                            auto_lines=[b"vidmode " + mode.encode(), b"vidq > c:\\v1.txt",
+                                        b"dg /k b: > c:\\log.txt", b"vidq > c:\\v2.txt"],
+                            files=[vm, vq])
+                        t = lambda f: subprocess.run(["mtype", "-i", d, "::" + f],
+                                                     capture_output=True).stdout.decode("latin1").strip()
+                        v1, v2 = t("V1.TXT"), t("V2.TXT")
+                        text = int(mode, 16) <= 3 or int(mode, 16) == 7
+                        pre = "%02X" % int(mode, 16)
+                        check(bool(back) and v1.startswith(pre),
+                              "CONTROL: vidmode really set mode %s (%s): %r" % (mode, kind, v1[:2]))
+                        if text:
+                            check(v2 == v1 and v2.endswith("MODEMARK"),
+                                  "mode %s (%s) comes back as itself, line and marker identical" % (mode, kind))
+                        else:
+                            check(v2.startswith("03 "),
+                                  "mode %s (%s) is not restorable: the host comes back in mode 03 (%r)"
+                                  % (mode, kind, v2[:2]))
+                    finally:
+                        shutil.rmtree(wd, ignore_errors=True)
+            finally:
+                shutil.rmtree(mw, ignore_errors=True)
+
         # --- A20: forced on for os8088, DOS's own state put back --------------
         if os.path.exists(os_img):
             aw = tempfile.mkdtemp(prefix="dosguest-a20-")
@@ -631,7 +705,9 @@ def main():
 
         # --- REAL DRIVERS, from the FreeDOS repository ---------------------
         # A toy TSR proves what its author thought of. These are somebody else's.
-        if not getfreedos.have_pkgs():
+        if host is not FREEDOS:
+            print("  SKIP real drivers: the packages are FreeDOS's")
+        elif not getfreedos.have_pkgs():
             print("  SKIP real drivers: python3 tools/getfreedos.py --pkgs")
         else:
             pk = lambda n, m: getfreedos.pkg_path(n, m)
@@ -750,6 +826,25 @@ def main():
             shutil.rmtree(w2, ignore_errors=True)
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+def main():
+    global HOST
+    for tool in ("nasm", "qemu-system-i386", "mcopy", "mformat", "mtype"):
+        if not shutil.which(tool):
+            print("dosguest: SKIP, no %s" % tool)
+            return 0
+    hosts = [h for h, ok in ((FREEDOS, getfreedos.have()), (SVARDOS, getfreedos.have_svardos())) if ok]
+    if not hosts:
+        print("dosguest: SKIP, no DOS (python3 tools/getfreedos.py)")
+        return 0
+    if SVARDOS not in hosts:
+        print("  SKIP SvarDOS: python3 tools/getfreedos.py --svardos")
+    dgfat.selfcheck()
+    for h in hosts:
+        HOST = h
+        print("=" * 72 + "\nDOS host: %s\n" % h.name + "=" * 72)
+        scenarios(h)
     print("dosguest: %s" % ("FAIL (%d)" % len(FAILS) if FAILS else "ok"))
     return 1 if FAILS else 0
 

@@ -74,6 +74,9 @@ noinval     db 0                    ; /N: skip invalidating DOS's buffers (a tes
 a20flip     db 0                    ; /A: leave A20 the wrong way round on return (a test)
 a20skip     db 0                    ; /Z: ...and do not put it right (the control)
 extshow     db 0                    ; /X: show os8088 the extended memory (the control)
+wflag       db 0                    ; /W: let os8088 WRITE (see wmask); the default is no unit
+wmask       db 0                    ; bit n = floppy n, bit 7 = any hard disk
+wtest       db 0                    ; /F: try a write through the live INT 13h (a test)
 t_snap      dw 0, 0                 ; seconds of the day at the snapshot, and after
 t_after     dw 0, 0
 tmp_h       db 0
@@ -205,9 +208,42 @@ main:
     jmp .cl
 .sw6:
     cmp al, 'X'
-    jne .cl
+    jne .sw7
     mov byte [extshow], 1
     jmp .cl
+.sw7:
+    cmp al, 'F'
+    jne .sw8
+    mov byte [wtest], 1
+    jmp .cl
+.sw8:
+    cmp al, 'W'
+    jne .cl
+    mov byte [wflag], 1             ; /W alone: the os8088 boot unit. /WA /WB /WH /W*:
+.wl:                                ; floppy A, floppy B, any hard disk, everything
+    mov al, [si]
+    cmp al, '*'
+    jne .wa
+    mov byte [wmask], 0xFF
+    jmp .wn
+.wa:
+    and al, 0xDF
+    cmp al, 'A'
+    jne .wb
+    or byte [wmask], 1
+    jmp .wn
+.wb:
+    cmp al, 'B'
+    jne .wh
+    or byte [wmask], 2
+    jmp .wn
+.wh:
+    cmp al, 'H'
+    jne .cl
+    or byte [wmask], 0x80
+.wn:
+    inc si
+    jmp .wl
 .badboot:
     mov dx, msg_boot
     jmp fail
@@ -300,6 +336,10 @@ main:
     jnz resumed
     ; --- first return: what os8088 would do to the machine ------------------
     MARK 'k'
+    cmp byte [wtest], 0
+    je .nowt
+    call write_test                 ; through the LIVE int 13h: os8088's
+.nowt:
     cmp byte [bootmode], 0
     je .trash
     call far [cs:stub_boot_far]     ; never returns: Restart's int 19h does
@@ -777,6 +817,28 @@ save_vectors:
     mov [es:si+4], ax
     mov byte [es:blk_filter], 1
 .nofilter:
+    ; ...and an INT 13h that REFUSES WRITES to any unit DOS can see, except the ones
+    ; /W names (by default only the floppy os8088 was booted from, and with a bare
+    ; /W). os8088 reaches its disks through this vector, so a volume DOS has cached
+    ; cannot be changed under it. A DRIVER THAT TALKS TO THE IDE PORTS DIRECTLY
+    ; (os8088's hard-disk driver can) is not stopped by it.
+    mov al, [wmask]
+    cmp byte [wflag], 0
+    je .wm
+    test al, al
+    jnz .wm
+    mov cl, [bootunit]              ; a bare /W: the unit os8088 booted from
+    mov al, 1
+    shl al, cl
+.wm:
+    mov [es:blk_wmask], al
+    mov bx, [cl_i13]
+    call .ent
+    sub si, cleanlist
+    add si, blk_cl
+    mov word [es:si+2], stub_int13
+    mov ax, [hseg]
+    mov [es:si+4], ax
     mov al, [a20flip]
     mov [es:blk_a20flip], al
     mov al, [a20skip]
@@ -827,6 +889,72 @@ prime_cache:
 .no:
     ret
 primespec db '\*.*', 0
+
+; =============================================================================
+; write_test (/F, a test): try to WRITE a sector through the live INT 13h - the
+; one os8088 would be given - using the extended write (AH=43h), which takes an
+; LBA and needs no CHS. The target is sector 40 of the swap file's video area,
+; which nothing uses in the self-test, so a write that does get through is harmless
+; and shows up on the host. Records the BIOS's answer.
+; =============================================================================
+write_test:
+    mov es, [hseg]
+    ; the sector's LBA: file sector (image + 40), through the extent list
+    mov ax, [es:blk_img_secs]
+    add ax, 40
+    mov si, blk_runs
+    mov cx, [es:blk_nruns]
+.r: test cx, cx
+    jz .out
+    mov dx, [es:si+4]
+    cmp ax, dx
+    jb .here
+    sub ax, dx
+    add si, 6
+    dec cx
+    jmp .r
+.here:
+    mov bx, [es:si]
+    mov dx, [es:si+2]
+    add bx, ax
+    adc dx, 0
+    mov [wt_pkt+8], bx
+    mov [wt_pkt+10], dx
+    ; a recognisable sector, in the aligned buffer
+    push cs
+    pop es
+    mov di, [secbuf]
+    mov cx, 256
+    mov ax, 'GD'
+.f: stosw
+    loop .f
+    mov ax, [secbuf]
+    mov [wt_pkt+4], ax
+    mov [wt_pkt+6], cs
+    mov es, [hseg]
+    mov dl, [es:blk_unit]
+    push cs
+    pop es
+    mov si, wt_pkt
+    mov ah, 0x43
+    xor al, al
+    int 0x13
+    mov bl, 0                       ; the answer goes in the BLOCK: the launcher's own
+    jnc .nc                         ; memory is rewound to the snapshot by the restore
+    mov bl, 1
+.nc:
+    mov bh, ah
+    mov es, [hseg]
+    mov [es:blk_wt_ah], bh
+    mov [es:blk_wt_cf], bl
+.out:
+    push cs
+    pop es
+    ret
+wt_pkt  db 16, 0
+        dw 1
+        dw 0, 0                     ; the buffer, offset and segment
+        dw 0, 0, 0, 0               ; the LBA, 64 bits
 
 ; =============================================================================
 ; dos_secs: DOS's clock as seconds since midnight, DX:AX
@@ -1581,6 +1709,15 @@ report:                             ; ES = the block
     mov ax, [es:blk_ret_tick]
     call emit_hex16
     call emit_crlf
+    mov si, r_wtest
+    call emit_str
+    mov al, [es:blk_wt_ah]
+    call emit_hex8
+    mov al, [es:blk_wt_cf]
+    call emit_hex8
+    mov al, [es:blk_wmask]
+    call emit_hex8
+    call emit_crlf
     mov si, r_filter
     call emit_str
     mov al, [es:blk_filter]
@@ -1676,6 +1813,7 @@ r_heur   db 'heuristic_unwraps=', 0
 r_nruns  db 'nruns=', 0
 r_a20    db 'a20_dos_boot_final=', 0
 r_filter db 'int15_filter=', 0
+r_wtest  db 'wtest_ah_cf_wmask=', 0
 r_tsnap  db 'dos_secs_snap=', 0
 r_taft   db 'dos_secs_after=', 0
 r_mode   db 'bootmode=', 0
@@ -1760,6 +1898,9 @@ blk_op      dw 2
 blk_rom13   dw 0, 0
 blk_rom15   dw 0, 0
 blk_filter db 0
+blk_wmask   db 0
+blk_wt_ah   db 0xFF
+blk_wt_cf   db 0xFF
 blk_a20_dos db 0
 blk_a20_boot db 0
 blk_a20_final db 0
@@ -1848,6 +1989,57 @@ stub_int15:
     push bp
     mov bp, sp
     or word [bp+6], 1
+    pop bp
+    iret
+
+; ----- stub_int13: the INT 13h os8088 is given ---------------------------------------
+; Writes (AH=03h, 05h-07h format, 0Bh, 0Fh, 43h) go to the ROM only for a unit
+; whose bit is in [blk_wmask]; otherwise the answer is "write protected" (AH=03h,
+; CF set) and nothing reaches the disk. Reads, resets and everything else go
+; straight to the ROM. DL = the unit: 0 to 3 floppies (bits 0 to 3), 80h up hard.
+stub_int13:
+    cmp ah, 0x03
+    je .w
+    cmp ah, 0x05
+    je .w
+    cmp ah, 0x06
+    je .w
+    cmp ah, 0x07
+    je .w
+    cmp ah, 0x0B
+    je .w
+    cmp ah, 0x0F
+    je .w
+    cmp ah, 0x43
+    je .w
+.rom:
+    jmp far [cs:blk_rom13]
+.w: push bx
+    push cx
+    mov bl, dl
+    mov cl, 7                       ; any hard disk: bit 7
+    cmp bl, 0x80
+    jae .bit
+    cmp bl, 4
+    jae .deny                       ; not a unit this knows
+    mov cl, bl
+.bit:
+    mov bl, 1
+    shl bl, cl
+    test [cs:blk_wmask], bl
+    pop cx
+    pop bx
+    jnz .rom
+    jmp .refuse
+.deny:
+    pop cx
+    pop bx
+.refuse:
+    mov ah, 0x03                    ; write protected
+    xor al, al
+    push bp
+    mov bp, sp
+    or word [bp+6], 1               ; CF set in the flags INT pushed
     pop bp
     iret
 
