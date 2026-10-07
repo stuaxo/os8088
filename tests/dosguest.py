@@ -396,6 +396,49 @@ def run_boot(work, os_img, auto_lines=None, files=(), cfg_extra=(), during=None,
     return back, data, info
 
 
+def v86_scenario(host):
+    """DOS, the launcher, kern_emu's os8088 and Restart, in v86 under node."""
+    v86dir = os.environ.get("V86_DIR") or os.path.abspath(os.path.join(ROOT, "..", "..", "v86"))
+    emu = os.path.join(ROOT, "build", "emu.img")
+    if not (shutil.which("node") and os.path.exists(os.path.join(v86dir, "build", "libv86.mjs"))
+            and os.path.exists(emu) and os.path.exists(os.path.join(ROOT, "build", "emuk", "kernel.bin"))):
+        print("  SKIP v86: needs node, a v86 build (V86_DIR), `make emu`")
+        return
+    wd = tempfile.mkdtemp(prefix="dosguest-v86-")
+    try:
+        env = dict(os.environ, OS88_BUILD="build/emuk", OS88_DEFINES="KERN_EMU")
+        out = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "os88sym.py"), "mem_top", "ticks"],
+                             capture_output=True, text=True, cwd=ROOT, env=env)
+        syms_ = {l.split()[0]: int(l.split()[3], 16) for l in out.stdout.strip().splitlines() if len(l.split()) >= 4}
+        if "mem_top" not in syms_:
+            print("  SKIP v86: no symbols for the emu kernel: %s" % out.stderr.strip()[-120:])
+            return
+        com = os.path.join(wd, "DG.COM")
+        sh("nasm", "-w+error", "-f", "bin", "-o", com, os.path.join(ROOT, "dosguest", "dg.asm"))
+        boot = host.boot_image(wd, [b"dg /k b:", b"echo DOSGUEST-BACK"], power=False)
+        hda = os.path.join(wd, "hda.img")
+        sh("mformat", "-C", "-T", "16384", "-h", "16", "-s", "63", "-i", hda, "::")
+        sh("mcopy", "-o", "-i", hda, com, "::DG.COM")
+        outimg = os.path.join(wd, "hda-out.img")
+        print("v86 (node): FreeDOS, dg, kern_emu's os8088 with the absolute pointer, Restart")
+        p = subprocess.run(["node", os.path.join(ROOT, "tests", "dosguest_v86.mjs"), boot, emu, hda,
+                            str(syms_["mem_top"]), str(syms_["ticks"]), outimg],
+                           capture_output=True, text=True, timeout=420,
+                           env=dict(os.environ, V86_DIR=v86dir))
+        print("  " + "\n  ".join(l for l in p.stdout.splitlines() if l.startswith(("[v86]", "RESULT"))))
+        check(p.returncode == 0 and os.path.exists(outimg), "os8088 ran under v86 and Restart brought DOS back (exit %d)" % p.returncode)
+        if os.path.exists(outimg):
+            r = read_result(outimg)
+            check(r is not None and r.get("resumed") == "1", "the launcher's result is on the disk v86 wrote back")
+            if r is not None:
+                g = lambda k: int(r[k], 16)
+                check(g("mismatches") == 0 and g("ivt_mismatches") == 0,
+                      "memory and the IVT came back under v86")
+                check(g("bootfail") == 0 and g("bootmode") == 1, "the boot sector loaded under v86")
+    finally:
+        shutil.rmtree(wd, ignore_errors=True)
+
+
 def scenarios(host):
     """Everything, against one DOS."""
     work = tempfile.mkdtemp(prefix="dosguest-")
@@ -932,6 +975,8 @@ def scenarios(host):
             shutil.rmtree(w2, ignore_errors=True)
     finally:
         shutil.rmtree(work, ignore_errors=True)
+    if host is FREEDOS:
+        v86_scenario(host)
 
 
 def main():
