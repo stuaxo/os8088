@@ -74,6 +74,9 @@ noinval     db 0                    ; /N: skip invalidating DOS's buffers (a tes
 a20flip     db 0                    ; /A: leave A20 the wrong way round on return (a test)
 a20skip     db 0                    ; /Z: ...and do not put it right (the control)
 extshow     db 0                    ; /X: show os8088 the extended memory (the control)
+force3      db 0
+dos_classic db 0                    ; DOS before 3.31: INT 25h's classic form only
+chsonly     db 0                    ; /C: CHS only, never the extended calls (a test)
 wflag       db 0                    ; /W: let os8088 WRITE (see wmask); the default is no unit
 wmask       db 0                    ; bit n = floppy n, bit 7 = any hard disk
 wtest       db 0                    ; /F: try a write through the live INT 13h (a test)
@@ -118,7 +121,7 @@ dirname     db 'DGSWAP  IMG'
 msg_boot    db 'DG: wave 2 boots os8088 from a floppy only: DG A: or DG B:', 13, 10, '$'
 msg_v86     db 'DG: the CPU is in protected or virtual-8086 mode (EMM386, JEMM, QEMM, Windows)', 13, 10
             db '    os8088 needs the real machine. Boot without the memory manager.', 13, 10, '$'
-msg_dos     db 'DG: needs DOS 3.31 or later', 13, 10, '$'
+msg_dos     db 'DG: needs DOS 3.0 or later', 13, 10, '$'
 msg_mem     db 'DG: cannot allocate the hidden block', 13, 10, '$'
 msg_swap    db 'DG: cannot write \DGSWAP.IMG', 13, 10, '$'
 msg_bpb     db 'DG: unsupported volume (512-byte sectors, FAT12 or FAT16 only)', 13, 10, '$'
@@ -217,6 +220,16 @@ main:
     mov byte [wtest], 1
     jmp .cl
 .sw8:
+    cmp al, 'C'
+    jne .sw9
+    mov byte [chsonly], 1
+    jmp .cl
+.sw9:
+    cmp al, '3'
+    jne .swa
+    mov byte [force3], 1            ; /3: use INT 25h's classic form whatever DOS this is (a test)
+    jmp .cl
+.swa:
     cmp al, 'W'
     jne .cl
     mov byte [wflag], 1             ; /W alone: the os8088 boot unit. /WA /WB /WH /W*:
@@ -248,7 +261,10 @@ main:
     mov dx, msg_boot
     jmp fail
 .cldone:
-    ; --- DOS 3.31+ for INT 25h's packet form --------------------------------
+    ; --- DOS 3.0 or later. 3.31 and up read the boot sector with INT 25h's packet
+    ; form, which names a sector with 32 bits; 3.0 to 3.30 have only the classic
+    ; form (a 16-bit sector number), so a volume over 32 MB is out of reach there.
+    ; THE CLASSIC PATH IS UNTESTED: no DOS 3.x was available to run it on.
     mov ah, 0x30
     int 0x21
     cmp al, 4
@@ -257,10 +273,16 @@ main:
     jne .dosbad
     cmp ah, 31
     jae .dosok
+    mov byte [dos_classic], 1
+    jmp .dosok
 .dosbad:
     mov dx, msg_dos
     jmp fail
 .dosok:
+    cmp byte [force3], 0
+    je .nf3
+    mov byte [dos_classic], 1
+.nf3:
     int 0x12
     mov [total_kb], ax
     call check_real_mode
@@ -1195,11 +1217,22 @@ read_bpb:
     mov [pk_off], ax
     mov [pk_seg], cs
     mov al, [drive]
+    cmp byte [dos_classic], 0
+    jne .classic
     mov cx, 0xFFFF
     mov bx, pk_sec
     int 0x25
     pop ax                          ; INT 25h leaves the flags on the stack
     jc .bad
+    jmp .read
+.classic:
+    mov cx, 1                       ; one sector, number 0, into DS:BX
+    xor dx, dx
+    mov bx, [secbuf]
+    int 0x25
+    pop ax
+    jc .bad
+.read:
     mov si, [secbuf]
     mov di, bootsave
     mov cx, 256
@@ -1356,6 +1389,27 @@ set_unit:
     mov al, dh
     inc al
     mov [es:blk_heads], ax
+    ; the BIOS's extended read and write, for a hard disk, unless /C: with CHS a
+    ; partition beyond the 1,024th cylinder (the first 8 GB) cannot be addressed
+    mov byte [es:blk_edd], 0
+    cmp byte [chsonly], 0
+    jne .okk
+    mov al, [es:blk_unit]
+    cmp al, 0x80
+    jb .okk
+    push es
+    mov ah, 0x41
+    mov bx, 0x55AA
+    mov dl, al
+    int 0x13
+    pop es
+    jc .okk
+    cmp bx, 0xAA55
+    jne .okk
+    test cl, 1                      ; bit 0: the 42h to 44h subset (read, write, verify)
+    jz .okk
+    mov byte [es:blk_edd], 1
+.okk:
     clc
 .out:
     pop es
@@ -1709,6 +1763,18 @@ report:                             ; ES = the block
     mov ax, [es:blk_ret_tick]
     call emit_hex16
     call emit_crlf
+    mov si, r_edd
+    call emit_str
+    mov al, [es:blk_edd]
+    call emit_hex8
+    call emit_crlf
+    mov si, r_hid
+    call emit_str
+    mov ax, [bpb_hid+2]
+    call emit_hex16
+    mov ax, [bpb_hid]
+    call emit_hex16
+    call emit_crlf
     mov si, r_wtest
     call emit_str
     mov al, [es:blk_wt_ah]
@@ -1814,6 +1880,8 @@ r_nruns  db 'nruns=', 0
 r_a20    db 'a20_dos_boot_final=', 0
 r_filter db 'int15_filter=', 0
 r_wtest  db 'wtest_ah_cf_wmask=', 0
+r_edd    db 'edd=', 0
+r_hid    db 'hidden_sectors=', 0
 r_tsnap  db 'dos_secs_snap=', 0
 r_taft   db 'dos_secs_after=', 0
 r_mode   db 'bootmode=', 0
@@ -1924,6 +1992,8 @@ t_hd        dw 0
 t_sec0      dw 0
 t_n         dw 0
 t_run       dw 0
+blk_edd     db 0                    ; 1: this unit takes INT 13h AH=42h/43h
+t_pkt       times 16 db 0
 t_rem       dw 0
 blk_img_secs dw 0
 blk_bounce  dw 0
@@ -2319,6 +2389,8 @@ stub_rw:
     je .ok
     mov ax, [t_lba]
     mov dx, [t_lba+2]
+    cmp byte [blk_edd], 0
+    jne .eddn                       ; the BIOS takes an LBA: no geometry to run out of
     call lba_chs
     jc .fail
     ; n = min(spt - sec0, count, 63, DMA room)
@@ -2326,6 +2398,7 @@ stub_rw:
     sub ax, [t_sec0]
     cmp ax, [t_cnt]
     jbe .a
+.eddn:
     mov ax, [t_cnt]
 .a: cmp ax, 63
     jbe .b
@@ -2345,6 +2418,8 @@ stub_rw:
     jae .c
     mov [t_n], ax
 .c: mov bp, 3                       ; three tries
+    cmp byte [blk_edd], 0
+    jne .edd
 .try:
     mov ax, [t_cyl]
     mov ch, al
@@ -2367,6 +2442,37 @@ stub_rw:
     call bios13                     ; reset
     dec bp
     jnz .try
+    mov [blk_err], ax
+    jmp .fail
+    jmp .did
+.edd:                               ; INT 13h AH=42h/43h: a packet with a 64-bit LBA
+    mov byte [t_pkt], 16
+    mov byte [t_pkt+1], 0
+    mov ax, [t_n]
+    mov [t_pkt+2], ax
+    mov [t_pkt+4], bx
+    mov [t_pkt+6], es
+    mov ax, [t_lba]
+    mov [t_pkt+8], ax
+    mov ax, [t_lba+2]
+    mov [t_pkt+10], ax
+    xor ax, ax
+    mov [t_pkt+12], ax
+    mov [t_pkt+14], ax
+.etry:
+    mov ax, [blk_op]
+    add al, 0x40                    ; 2 -> 42h read, 3 -> 43h write
+    mov ah, al
+    xor al, al
+    mov si, t_pkt
+    mov dl, [blk_unit]
+    call bios13
+    jnc .did
+    xor ax, ax
+    mov dl, [blk_unit]
+    call bios13                     ; reset
+    dec bp
+    jnz .etry
     mov [blk_err], ax
     jmp .fail
 .did:

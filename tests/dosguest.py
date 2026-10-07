@@ -147,15 +147,47 @@ def read_result(data):
     return res
 
 
-def run_guest(work, ram_mb, defs=(), secs=120, flags=b""):
+BIG_START = 16777216                  # 8 GB in sectors: past the 1,024th cylinder
+BIG_SECS = 204800                     # a 100 MB FAT16 partition
+
+
+def make_big_disk(path):
+    """A sparse 10 GB disk: an MBR and ONE FAT16 partition that starts at 8 GB.
+    CHS cannot address it (cylinder 1,024 is 8 GB in), and the volume's own
+    boot sector says it hides 16,777,216 sectors - which nothing else here does."""
+    with open(path, "wb") as f:
+        f.truncate(10 * 1024 ** 3)
+        ent = bytearray(16)
+        ent[0] = 0x80                                 # active
+        ent[1:4] = bytes((0xFE, 0xFF, 0xFF))          # CHS: out of range, as LBA disks say
+        ent[4] = 0x06                                 # FAT16 > 32 MB
+        ent[5:8] = bytes((0xFE, 0xFF, 0xFF))
+        ent[8:12] = BIG_START.to_bytes(4, "little")
+        ent[12:16] = BIG_SECS.to_bytes(4, "little")
+        f.seek(0x1BE)
+        f.write(ent)
+        f.seek(0x1FE)
+        f.write(b"\x55\xAA")
+    off = BIG_START * 512
+    sh("mformat", "-i", "%s@@%d" % (path, off), "-T", str(BIG_SECS), "-h", "255", "-s", "63",
+       "-H", str(BIG_START), "::")
+    return off
+
+
+def run_guest(work, ram_mb, defs=(), secs=120, flags=b"", big=False):
     """Boot FreeDOS with DG.COM on C:, return (result dict, data.img path)."""
     com = os.path.join(work, "DG.COM")
     sh("nasm", "-w+error", *defs, "-f", "bin", "-o", com,
        os.path.join(ROOT, "dosguest", "dg.asm"))
     boot = HOST.boot_image(work, [b"dg /k " + flags + b" > c:\\log.txt"])
     data = os.path.join(work, "data.img")
-    sh("mformat", "-C", "-T", "16384", "-h", "16", "-s", "63", "-i", data, "::")
-    sh("mcopy", "-o", "-i", data, com, "::DG.COM")
+    datai = data                      # what mtools' -i is given: the offset form for a big disk
+    if big:
+        datai = "%s@@%d" % (data, make_big_disk(data))
+        sh("mcopy", "-o", "-i", datai, com, "::DG.COM")
+    else:
+        sh("mformat", "-C", "-T", "16384", "-h", "16", "-s", "63", "-i", data, "::")
+        sh("mcopy", "-o", "-i", data, com, "::DG.COM")
     try:
         p = subprocess.run(
             ["qemu-system-i386", "-display", "none", "-no-reboot", "-m", str(ram_mb),
@@ -168,15 +200,15 @@ def run_guest(work, ram_mb, defs=(), secs=120, flags=b""):
         if not defs:
             check(False, "the guest finished inside %d s" % secs)
         res = None
-        txt = subprocess.run(["mtype", "-i", data, "::DGRESULT.TXT"], capture_output=True)
-        return ("hung" if txt.returncode else "wrote"), data
+        txt = subprocess.run(["mtype", "-i", datai, "::DGRESULT.TXT"], capture_output=True)
+        return ("hung" if txt.returncode else "wrote"), datai
     res = {"runs": []}
-    txt = subprocess.run(["mtype", "-i", data, "::DGRESULT.TXT"],
+    txt = subprocess.run(["mtype", "-i", datai, "::DGRESULT.TXT"],
                          capture_output=True)
     if txt.returncode:
-        log = subprocess.run(["mtype", "-i", data, "::LOG.TXT"], capture_output=True)
+        log = subprocess.run(["mtype", "-i", datai, "::LOG.TXT"], capture_output=True)
         print("  guest console: %r" % log.stdout.decode("latin1"))
-        return None, data
+        return None, datai
     for line in txt.stdout.decode("latin1").splitlines():
         if "=" not in line:
             continue
@@ -186,7 +218,7 @@ def run_guest(work, ram_mb, defs=(), secs=120, flags=b""):
             res["runs"].append((int(lba, 16), int(n, 16)))
         else:
             res[k] = v
-    return res, data
+    return res, datai
 
 
 def dos_session(work, auto_lines, files=(), secs=90, cfg_extra=()):
@@ -563,6 +595,47 @@ def scenarios(host):
                     shutil.rmtree(wd, ignore_errors=True)
         finally:
             shutil.rmtree(tw, ignore_errors=True)
+
+        # --- a disk the old addressing cannot reach ----------------------------
+        # A partition that starts 8 GB into a 10 GB disk: past the 1,024th cylinder,
+        # so CHS cannot name it, and the volume hides 16,777,216 sectors. The launcher
+        # uses the BIOS's extended calls when it can; /C is the control that cannot.
+        for flags, works, what in ((b"", True, "the swap file on a partition 8 GB into the disk (extended INT 13h)"),
+                                   (b"/c", False, "CONTROL: with CHS only the same disk cannot be reached")):
+            wd = tempfile.mkdtemp(prefix="dosguest-big-")
+            try:
+                rb, db = run_guest(wd, 8, flags=flags, big=True, secs=60 if works else 40)
+                if works:
+                    check(isinstance(rb, dict), what)
+                    if isinstance(rb, dict):
+                        g2 = lambda k: int(rb[k], 16)
+                        check(g2("mismatches") == 0 and g2("ivt_mismatches") == 0 and rb.get("resumed") == "1",
+                              "...and DOS came back from it")
+                        check(g2("hidden_sectors") == BIG_START and g2("edd") == 1,
+                              "...the volume hides %d sectors and the launcher used the extended calls"
+                              % g2("hidden_sectors"))
+                        part = open(db.split("@@")[0], "rb")
+                        part.seek(BIG_START * 512)
+                        vol = dgfat.Volume(part.read(BIG_SECS * 512))
+                        part.close()
+                        runs, size = vol.extents(b"DGSWAP  IMG")
+                        check([(l + BIG_START, n) for l, n in runs] == rb["runs"],
+                              "dgfat.py finds the guest's extents, which are past LBA %d" % BIG_START)
+                else:
+                    check(rb in ("hung", None) or (isinstance(rb, dict) and rb.get("resumed") != "1"),
+                          what + " (%s)" % (rb if not isinstance(rb, dict) else "ran"))
+            finally:
+                shutil.rmtree(wd, ignore_errors=True)
+
+        # --- DOS 3.0 to 3.30: INT 25h's classic form ----------------------------
+        # No DOS 3.x is here to run it on, so this proves the PATH and not that DOS.
+        wd = tempfile.mkdtemp(prefix="dosguest-cls-")
+        try:
+            rc, dc = run_guest(wd, 8, flags=b"/3")
+            check(isinstance(rc, dict) and rc.get("resumed") == "1" and int(rc["mismatches"], 16) == 0,
+                  "the classic INT 25h path (as DOS 3.30 has) finds the volume and the round trip works")
+        finally:
+            shutil.rmtree(wd, ignore_errors=True)
 
         # --- os8088 may not write what DOS can see ----------------------------
         # os8088 reaches its disks through INT 13h, and the launcher hands it one
