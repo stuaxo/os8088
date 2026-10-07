@@ -272,7 +272,7 @@ def run_boot(work, os_img, auto_lines=None, files=(), cfg_extra=(), during=None)
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     info = {}
     try:
-        syms = sym("mem_top", "ticks")
+        syms = sym("mem_top", "ticks", "xm_row")
         t0 = time.time()
         # os8088 is up when its mem_top is a plausible machine and a desktop is drawn
         while time.time() - t0 < 120:
@@ -316,6 +316,9 @@ def run_boot(work, os_img, auto_lines=None, files=(), cfg_extra=(), during=None)
             return None, data, info
         if during is not None:
             during(osd, data)            # while os8088 runs: the host changes a disk
+        # XMEM.DRV's driver row: DRVR_SEG +2 (0 = not loaded), DRVR_KB +8, DRVR_WANT +13
+        xr = syms["xm_row"]
+        info["xmem"] = (peek16(sock, xr + 2), peek16(sock, xr + 8), (peek16(sock, xr + 12) or 0) >> 8)
         tk = peek16(sock, syms["ticks"])
         time.sleep(3)
         tk2 = peek16(sock, syms["ticks"])
@@ -559,6 +562,43 @@ def main():
         finally:
             shutil.rmtree(tw, ignore_errors=True)
 
+        # --- A20: forced on for os8088, DOS's own state put back --------------
+        if os.path.exists(os_img):
+            aw = tempfile.mkdtemp(prefix="dosguest-a20-")
+            try:
+                progs = {}
+                for nm in ("a20q", "a20off"):
+                    out = os.path.join(aw, nm + ".com")
+                    sh("nasm", "-w+error", "-f", "bin", "-o", out,
+                       os.path.join(ROOT, "tests", "dgtsr", nm + ".asm"))
+                    progs[nm] = out
+                print("A20: the way os8088 leaves it is not DOS's problem")
+                dg_a, dg_az = b"dg /k /a b: > c:\\log.txt", b"dg /k /a /z b: > c:\\log.txt"
+                for what, lines, want_probe, want_rep in (
+                        ("on at DOS; the return leaves it OFF; the launcher puts it back",
+                         [b"a20q > c:\\a0.txt", dg_a, b"a20q > c:\\a1.txt"], ("1", "1"), "010101"),
+                        ("CONTROL: the same with the restore skipped leaves DOS with A20 OFF",
+                         [b"a20q > c:\\a0.txt", dg_az, b"a20q > c:\\a1.txt"], ("1", "0"), "010100"),
+                        ("OFF at DOS: os8088 still boots (A20 forced on) and DOS gets it OFF again",
+                         [b"a20off", b"a20q > c:\\a0.txt", b"dg /k b: > c:\\log.txt", b"a20q > c:\\a1.txt"],
+                         ("0", "0"), "000100")):
+                    wd = tempfile.mkdtemp(prefix="dosguest-a20r-")
+                    try:
+                        back, d, info = run_boot(wd, os_img, auto_lines=lines,
+                                                 files=[progs["a20q"], progs["a20off"]])
+                        t = lambda f: subprocess.run(["mtype", "-i", d, "::" + f],
+                                                     capture_output=True).stdout.decode().strip()
+                        r5 = read_result(d) if back else None
+                        got = (t("A0.TXT"), t("A1.TXT"))
+                        check(bool(back) and r5 is not None and got == want_probe
+                              and r5.get("a20_dos_boot_final") == want_rep,
+                              "%s (probe %s, guest %s)" % (what, got,
+                                                          r5.get("a20_dos_boot_final") if r5 else None))
+                    finally:
+                        shutil.rmtree(wd, ignore_errors=True)
+            finally:
+                shutil.rmtree(aw, ignore_errors=True)
+
         # --- the disk changes while os8088 runs ------------------------------
         # Whoever writes the volume, DOS cannot tell: here the HOST adds a file to
         # C: while os8088 runs, which is what os8088 writing there looks like from
@@ -602,16 +642,29 @@ def main():
                 sh("nasm", "-w+error", "-f", "bin", "-o", dq, os.path.join(ROOT, "tests", "dgtsr", "drvq.asm"))
                 aq = os.path.join(aw, "a20q.com")
                 sh("nasm", "-w+error", "-f", "bin", "-o", aq, os.path.join(ROOT, "tests", "dgtsr", "a20q.asm"))
+                xq = os.path.join(aw, "xmsq.com")
+                sh("nasm", "-w+error", "-f", "bin", "-o", xq, os.path.join(ROOT, "tests", "dgtsr", "xmsq.asm"))
+                # the manager's answers with NO launcher at all: what "happy" is
+                wd0 = tempfile.mkdtemp(prefix="dosguest-xref-")
+                try:
+                    _, dref = dos_session(wd0, [b"xmsq f > c:\\x0.txt", b"xmsq c > c:\\x1.txt"],
+                                          files=[xq, HM], cfg_extra=[b"DEVICE=C:\\HIMEMX.EXE"])
+                    xref = subprocess.run(["mtype", "-i", dref, "::X1.TXT"], capture_output=True).stdout.decode()
+                finally:
+                    shutil.rmtree(wd0, ignore_errors=True)
+                print("  XMS manager with no launcher: %r" % xref)
                 if os.path.exists(os_img):
                     print("real drivers through os8088: HIMEMX (XMS, hooks INT 15h) and CTMOUSE (hooks INT 10h)")
                     wd = tempfile.mkdtemp(prefix="dosguest-real-")
                     try:
                         back, d, info = run_boot(
                             wd, os_img,
-                            auto_lines=[b"ctmouse", b"drvq > c:\\d0.txt", b"a20q > c:\\a0.txt",
+                            auto_lines=[b"ctmouse", b"xmsq f > c:\\xf.txt",
+                                        b"drvq > c:\\d0.txt", b"a20q > c:\\a0.txt",
                                         b"dg /k b: > c:\\log.txt",
-                                        b"drvq > c:\\d1.txt", b"a20q > c:\\a1.txt"],
-                            files=[CT, HM, dq, aq], cfg_extra=[b"DEVICE=C:\\HIMEMX.EXE"])
+                                        b"drvq > c:\\d1.txt", b"a20q > c:\\a1.txt",
+                                        b"xmsq c > c:\\x2.txt"],
+                            files=[CT, HM, dq, aq, xq], cfg_extra=[b"DEVICE=C:\\HIMEMX.EXE"])
                         rr = read_result(d) if back else None
                         check(rr is not None and rr.get("resumed") == "1",
                               "DG accepted HIMEMX and CTMOUSE, booted os8088 and resumed")
@@ -626,10 +679,31 @@ def main():
                             check(d1 == d0, "XMS (version, free memory, A20) and the mouse driver are "
                                   "the same after os8088: nothing the image does not cover was lost")
                             check(a0 == "1" and a1 == "1", "A20 is on before and after")
+                            check(info.get("xmem") == (0, 0, 0),
+                                  "os8088 was shown NO extended memory: XMEM.DRV is not wanted and not loaded "
+                                  "(its row: %s)" % (info.get("xmem"),))
+                            x2 = t("X2.TXT").replace("\r", "")
+                            check(x2.replace("\n", " ").startswith("XMSDATA=0000"),
+                                  "the 512 KB XMS block filled before os8088 ran holds its pattern after: %r"
+                                  % x2.split("\n")[0])
+                            check(x2.strip() == xref.replace("\r", "").strip(),
+                                  "the manager still allocates and frees, hands out the HMA, and drives A20 "
+                                  "exactly as it does with no launcher: %r" % x2.replace("\n", " "))
                             check(g("heuristic_unwraps") >= 2,
                                   "the INT 15h and INT 10h hooks were unwrapped by the scan (%d)" % g("heuristic_unwraps"))
                             check(g("mismatches") == 0 and g("ivt_mismatches") == 0,
                                   "memory and the IVT came back with both resident")
+                    finally:
+                        shutil.rmtree(wd, ignore_errors=True)
+                if os.path.exists(os_img):
+                    print("CONTROL: with the INT 15h filter off (/X), os8088 loads XMEM.DRV on top of the XMS manager")
+                    wd = tempfile.mkdtemp(prefix="dosguest-x-")
+                    try:
+                        back, d, info = run_boot(wd, os_img, auto_lines=[b"dg /k /x b: > c:\\log.txt"],
+                                                 files=[HM], cfg_extra=[b"DEVICE=C:\\HIMEMX.EXE"])
+                        xm = info.get("xmem")
+                        check(bool(xm) and xm[0] != 0 and xm[2] == 1,
+                              "CONTROL: without the filter XMEM.DRV is wanted and resident (row %s)" % (xm,))
                     finally:
                         shutil.rmtree(wd, ignore_errors=True)
                 print("real drivers that must be accepted (the launcher alone):")

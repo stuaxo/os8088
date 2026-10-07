@@ -71,6 +71,9 @@ drive       db 0                    ; 0 = A
 keep        db 0
 prime       db 0                    ; /P: re-populate DOS's directory cache (a test)
 noinval     db 0                    ; /N: skip invalidating DOS's buffers (a test)
+a20flip     db 0                    ; /A: leave A20 the wrong way round on return (a test)
+a20skip     db 0                    ; /Z: ...and do not put it right (the control)
+extshow     db 0                    ; /X: show os8088 the extended memory (the control)
 t_snap      dw 0, 0                 ; seconds of the day at the snapshot, and after
 t_after     dw 0, 0
 tmp_h       db 0
@@ -187,8 +190,23 @@ main:
     jmp .cl
 .sw3:
     cmp al, 'N'
-    jne .cl
+    jne .sw4
     mov byte [noinval], 1
+    jmp .cl
+.sw4:
+    cmp al, 'A'
+    jne .sw5
+    mov byte [a20flip], 1
+    jmp .cl
+.sw5:
+    cmp al, 'Z'
+    jne .sw6
+    mov byte [a20skip], 1
+    jmp .cl
+.sw6:
+    cmp al, 'X'
+    jne .cl
+    mov byte [extshow], 1
     jmp .cl
 .badboot:
     mov dx, msg_boot
@@ -402,6 +420,7 @@ cl_count    dw 0
 cl_i13      dw 0                    ; the entries the stub needs by name
 cl_i0e      dw 0
 cl_i76      dw 0
+cl_i15      dw 0
 vec_cur     dw 0
 cls_cur     db 0
 heur_n      dw 0                    ; vectors unwrapped by the heuristic, reported
@@ -479,6 +498,11 @@ build_clean:
     mov cx, [cl_count]
     mov [cl_i76], cx
 .n76:
+    cmp bx, 0x15
+    jne .n15
+    mov cx, [cl_count]
+    mov [cl_i15], cx
+.n15:
     mov [di], bx
     mov [di+2], ax
     mov [di+4], dx
@@ -735,6 +759,28 @@ save_vectors:
     mov [es:blk_cl76], ax
     mov ax, [si+4]
     mov [es:blk_cl76+2], ax
+    mov bx, [cl_i15]
+    call .ent
+    mov ax, [si+2]
+    mov [es:blk_rom15], ax
+    mov ax, [si+4]
+    mov [es:blk_rom15+2], ax
+    ; os8088 is given an INT 15h that reports NO extended memory and refuses
+    ; block moves, so its XMEM.DRV does not load on top of an XMS manager (the
+    ; clean entry was the ROM's; the ROM's stays in blk_rom15 for everything else)
+    cmp byte [extshow], 0
+    jne .nofilter
+    sub si, cleanlist
+    add si, blk_cl
+    mov word [es:si+2], stub_int15
+    mov ax, [hseg]
+    mov [es:si+4], ax
+    mov byte [es:blk_filter], 1
+.nofilter:
+    mov al, [a20flip]
+    mov [es:blk_a20flip], al
+    mov al, [a20skip]
+    mov [es:blk_a20skip], al
     pop es
     ret
 .ent:                               ; BX = entry -> SI = its address in cleanlist
@@ -1535,6 +1581,20 @@ report:                             ; ES = the block
     mov ax, [es:blk_ret_tick]
     call emit_hex16
     call emit_crlf
+    mov si, r_filter
+    call emit_str
+    mov al, [es:blk_filter]
+    call emit_hex8
+    call emit_crlf
+    mov si, r_a20
+    call emit_str
+    mov al, [es:blk_a20_dos]
+    call emit_hex8
+    mov al, [es:blk_a20_boot]
+    call emit_hex8
+    mov al, [es:blk_a20_final]
+    call emit_hex8
+    call emit_crlf
     mov si, r_tsnap
     call emit_str
     mov ax, [t_snap+2]
@@ -1614,6 +1674,8 @@ r_c08    db 'clean_int08=', 0
 r_cn     db 'clean_vectors=', 0
 r_heur   db 'heuristic_unwraps=', 0
 r_nruns  db 'nruns=', 0
+r_a20    db 'a20_dos_boot_final=', 0
+r_filter db 'int15_filter=', 0
 r_tsnap  db 'dos_secs_snap=', 0
 r_taft   db 'dos_secs_after=', 0
 r_mode   db 'bootmode=', 0
@@ -1696,6 +1758,14 @@ blk_spt     dw 0
 blk_heads   dw 0
 blk_op      dw 2
 blk_rom13   dw 0, 0
+blk_rom15   dw 0, 0
+blk_filter db 0
+blk_a20_dos db 0
+blk_a20_boot db 0
+blk_a20_final db 0
+blk_a20flip db 0
+blk_a20skip db 0
+t_a20       db 0
 blk_nruns   dw 0
 sv_ss       dw 0
 sv_sp       dw 0
@@ -1746,6 +1816,160 @@ blk_cl0e    dw 0, 0                 ; the clean INT 0Eh and 76h, for the disk IR
 blk_cl76    dw 0, 0
 blk_dos0e   dw 0, 0                 ; DOS's own, found by ivt_op's save pass
 blk_dos76   dw 0, 0
+
+; ----- stub_int15: the INT 15h os8088 is given ------------------------------------
+; Extended memory belongs to DOS's XMS manager, and os8088's XMEM.DRV would
+; otherwise load on a machine that answers AH=88h with 6 MB and claim it. So:
+; AH=88h and E801h say there is none, E820h and the AH=87h block move are
+; refused, and everything else goes to the ROM. Reached only while os8088 runs.
+stub_int15:
+    cmp ah, 0x88
+    je .none
+    cmp ah, 0x87
+    je .bad
+    cmp ax, 0xE801
+    je .e801
+    cmp ax, 0xE820
+    je .bad
+    jmp far [cs:blk_rom15]          ; the ROM answers, and returns to the caller
+.e801:
+    xor bx, bx
+    xor cx, cx
+    xor dx, dx
+.none:
+    xor ax, ax                      ; no KB above 1MB
+    push bp
+    mov bp, sp
+    and word [bp+6], 0xFFFE         ; CF clear in the flags INT pushed
+    pop bp
+    iret
+.bad:
+    mov ah, 0x86                    ; function not supported
+    push bp
+    mov bp, sp
+    or word [bp+6], 1
+    pop bp
+    iret
+
+; ----- A20 ---------------------------------------------------------------------
+; a20_test: AL = 1 if A20 is on, 0 if it is off. The wrap-around test, twice with
+; different patterns so a coincidence is not an answer: 0000:0080 and FFFF:0090
+; are one byte with A20 off and two with it on. Preserves everything else.
+a20_test:
+    push bx
+    push si
+    push di
+    push ds
+    push es
+    pushf
+    cli
+    xor ax, ax
+    mov ds, ax
+    mov ax, 0xFFFF
+    mov es, ax
+    mov si, 0x80
+    mov di, 0x90
+    mov bl, [si]                    ; the low byte, to put back
+    mov bh, 0                       ; 0 = on until both patterns say aliased
+    mov al, bl
+    xor al, 0x5A
+    mov [si], al
+    cmp al, [es:di]
+    jne .on
+    mov al, bl
+    xor al, 0xA5
+    mov [si], al
+    cmp al, [es:di]
+    jne .on
+    mov bh, 1                       ; both patterns showed through: aliased, off
+.on:
+    mov [si], bl
+    popf
+    pop es
+    pop ds
+    pop di
+    pop si
+    mov al, 1
+    test bh, bh
+    jz .out
+    xor al, al
+.out:
+    pop bx
+    ret
+
+; a20_set: AL = 1 on, 0 off. BIOS INT 15h first (the ROM's, through the saved
+; vector: a driver such as HIMEM hooks the live one), then the fast-A20 port 92h,
+; then the keyboard controller. Each is checked by the wrap test. CF if none took.
+a20_set:
+    push ax
+    push bx
+    push cx
+    push dx
+    mov [cs:t_a20], al
+    call a20_test
+    cmp al, [cs:t_a20]
+    je .ok
+    mov ax, 0x2401
+    cmp byte [cs:t_a20], 0
+    jne .b
+    mov ax, 0x2400
+.b: pushf
+    call far [cs:blk_rom15]
+    call a20_test
+    cmp al, [cs:t_a20]
+    je .ok
+    in al, 0x92                     ; fast A20. Bit 0 is a RESET: never set it
+    mov ah, al
+    and al, 0xFE
+    cmp byte [cs:t_a20], 0
+    jne .p1
+    and al, 0xFD
+    jmp .p2
+.p1:
+    or al, 2
+.p2:
+    out 0x92, al
+    xor cx, cx
+.w1: loop .w1
+    call a20_test
+    cmp al, [cs:t_a20]
+    je .ok
+    call kbc_wait
+    mov al, 0xD1
+    out 0x64, al
+    call kbc_wait
+    mov al, 0xDF
+    cmp byte [cs:t_a20], 0
+    jne .k
+    mov al, 0xDD
+.k: out 0x60, al
+    call kbc_wait
+    xor cx, cx
+.w2: loop .w2
+    call a20_test
+    cmp al, [cs:t_a20]
+    je .ok
+    stc
+    jmp .out
+.ok:
+    clc
+.out:
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+kbc_wait:                           ; the 8042's input buffer empties
+    push ax
+    push cx
+    xor cx, cx
+.l: in al, 0x64
+    test al, 2
+    jz .d
+    loop .l
+.d: pop cx
+    pop ax
+    ret
 
 ; ----- bios: INT 13h through the saved ROM vector, immune to the IVT's restore -
 bios13:
@@ -2071,6 +2295,8 @@ stub_suspend:
     jne .nat
     mov byte [cs:at_flag], 1
 .nat:
+    call a20_test
+    mov [cs:blk_a20_dos], al        ; DOS's A20: an XMS driver owns it, and os8088 will not
     call pic_quiet
     MARK 's'
     mov word [cs:blk_op], 3
@@ -2181,6 +2407,13 @@ restore_all:
     mov es, ax
     mov ax, [cs:blk_orig_kb]
     mov [es:0x413], ax
+    cmp byte [cs:blk_a20skip], 0
+    jne .noa20
+    mov al, [cs:blk_a20_dos]        ; DOS's A20, which an XMS driver believes it knows
+    call a20_set
+.noa20:
+    call a20_test
+    mov [cs:blk_a20_final], al
     cmp byte [cs:blk_bootmode], 0
     je .novid
     call restore_video              ; os8088 left the card in a graphics mode
@@ -2595,6 +2828,10 @@ stub_boot:
     mov ax, [es:0x46C]
     mov [blk_snap_tick], ax
     call save_video
+    mov al, 1                       ; a BIOS boot leaves A20 on, and os8088 is not
+    call a20_set                    ; written for it off (an XMS driver may have left it so)
+    call a20_test
+    mov [blk_a20_boot], al
     ; the boot sector, to 0000:7C00, by the ROM's own INT 13h
     mov bp, 3
 .try:
@@ -2662,6 +2899,11 @@ stub_return:
     mov ax, [es:0x46C]
     mov [blk_ret_tick], ax
     call pic_set_quiet              ; NOT pic_quiet: DOS's masks are already saved
+    cmp byte [blk_a20flip], 0
+    je restore_all
+    mov al, [blk_a20_dos]           ; /A, a test: os8088 "left" it the other way
+    xor al, 1
+    call a20_set
     jmp restore_all
 
 blk_runs    times (MAXRUNS * 6) db 0
