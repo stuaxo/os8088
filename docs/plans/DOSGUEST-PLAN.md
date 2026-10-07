@@ -1,6 +1,6 @@
 # `dosguest` - starting os8088 from DOS, and returning to it
 
-**Status: waves 1 and 2 are built and passing (sections 12 to 14): os8088 boots from a FreeDOS prompt, runs with real drivers resident, and Restart returns to a DOS whose clock, text video, vectors, memory and drivers are as they were. Not done: read-only enforcement, any DOS but FreeDOS, A20 restore, hard-disk boot.**
+**Status: everything in the version 1 plan is built and passing on FreeDOS 1.4 and SvarDOS (an Enhanced DR-DOS kernel) in QEMU, and the boot-and-return in v86 (sections 12 to 15). Not done, and not claimed: MS-DOS, IBM DOS 3.x, an emulated 8088 or real hardware, and the version 2 pass-through driver (section 8, a separate PR).**
 
 **The ask:** run os8088 from a DOS prompt, and exit back to that prompt with
 DOS as it was. The first version takes the whole machine. A later version lets
@@ -89,8 +89,7 @@ The block holds:
 | vector thunks | section 4.2 |
 | the INT 19h entry | where Restart lands |
 
-Size is a few hundred bytes plus the extent list. Round up to a paragraph and
-let os8088 lose 1 KB.
+The block is 8 KB (the stub, 128 extents and a 1 KB bounce buffer for the video area), so os8088 sees 624 KB on a 639 KB machine: the image is rounded down to 16 KB as well, so up to 16 KB below the block is in neither the snapshot nor os8088's machine. Rounding to 1 KB needs the swap file written in 1 KB-aligned chunks and is not done.
 
 ## 4. Entering os8088
 
@@ -207,7 +206,7 @@ machine, not to assume:
 | keyboard controller | drain the output buffer; restore the command byte if changed | |
 | video: mode, screen, cursor, font, palette, blink | **DONE** (section 14) | text modes only, in the swap file's video area |
 | the clock | **DONE** (section 14) | set from the RTC after the resume |
-| A20 | **not done**; tested only with A20 on | the stub should read it and put it back |
+| A20 | **DONE** (section 15) | saved at the snapshot, forced on for os8088, put back on return |
 | RTC, DMA | not saved in v1 | documented as not preserved, as SPEC.md 87 does |
 
 DOS drivers that own hardware (mouse, sound, network) keep state in the device,
@@ -229,19 +228,25 @@ had to know about the packed kernel. Booting the sector needs none of it. It
 answers what was open question 1: **os8088 needs no extent list and no help
 from the launcher to load, because it loads itself.**
 
-Wave 2 is **floppy only** (`DG A:` or `DG B:`). A hard-disk os8088 boots through
-`boot/mbr.asm` and `boot/boothd.asm`, and the stub would load an MBR and pass a
-partition entry. That is later work.
+`DG A:` or `DG B:` boots a floppy. **`DG D:` (any letter above B:) boots a
+hard-disk install**: the launcher reads the volume's boot sector through DOS, finds
+its BIOS unit by content and its first sector from the BPB's hidden sectors, and the
+stub loads that volume boot record to `0000:7C00` with the unit in `DL`.
+`boot/boothd.asm` needs nothing from the MBR (SPEC.md 52.10.2: it takes its own
+partition base from its BPB), so the MBR is not run. Tested (section 15).
 
 ### 4.5 Memory above 1 MB
 
-The image does not cover extended memory (SPEC.md 87.7 draws the same line). A
-host may have HIMEM.SYS, a RAM drive, a SMARTDRV cache or the HMA in use, and
-os8088's `XMEM.DRV` would write over them.
+The image does not cover extended memory (SPEC.md 87.7 draws the same line). A host
+may have HIMEM, a RAM drive, a cache or the HMA in use. os8088 sizes extended memory
+with `INT 15h AH=88h` and, finding some, **wants and loads `XMEM.DRV`** - which it
+did, in every early run on a machine with an XMS manager, on top of the manager.
+Section 15 has the measurement.
 
-v1 rule: **`XMEM.DRV` is not loaded under dosguest**, and the launcher refuses
-if the HMA is claimed. A later version can allocate through the XMS API and
-pass os8088 the range it owns.
+So os8088 is given an `INT 15h` that reports **no** extended memory (AH=88h and
+E801h), refuses E820h and the AH=87h block move, and chains the rest to the ROM.
+`XMEM.DRV` is then not wanted and not loaded, and DOS's XMS blocks are not touched.
+`/X` turns the filter off, as a control.
 
 ## 5. Disk consistency: v1 is read-only
 
@@ -277,8 +282,16 @@ invisible to DOS if its directory cache holds a stale sector, and visible after
 FreeDOS host with no disk cache. It does not cover an XMS read cache
 (LBACACHE, SMARTDRV), whose contents cannot be reached from outside, or an
 MS-DOS host, whose disk reset may flush without invalidating. Neither could be
-tested here. **So read-only enforcement is still the rule until writes are
-allowed by a switch that refuses a host with such a cache.**
+tested here. **So read-only is the rule, and it is ENFORCED** (below), with `/W` to allow
+writes where the user knows the host has no such cache.
+
+**Enforcement, with no kernel change.** os8088 reaches its disks through the BIOS's
+`INT 13h`, and the launcher already controls the one os8088 sees. It is given a
+handler that answers *write protected* (`AH=03h`, CF set) to writes (`AH=03h`,
+`05h`-`07h`, `0Bh`, `0Fh`, `43h`) for any unit not in a mask. A bare `/W` allows
+the os8088 boot unit; `/WA`, `/WB`, `/WH`, `/W*` name floppy A, floppy B, any hard
+disk, and everything. **A driver that talks to the IDE ports directly - os8088's
+hard-disk driver can - is not stopped by it**, and that is the hole.
 
 ## 6. Exiting os8088
 
@@ -354,10 +367,10 @@ the launcher asks for it.
 | W0 | Answer open questions 1 and 2 on paper: how the kernel picks volumes, what `kmain` assumes of stage 2. Confirm `int 12h` is the only source of `mem_top` and that nothing reads the BDA word directly. Decide whether v1 touches the kernel. | this document updated |
 | W1 | **DONE.** Launcher: hidden block, swap file, extent list, stub, vector policy. No os8088. `dosguest/dg.asm`, `tests/dosguest.py` | a DOS machine restores itself byte for byte, and the swap file read back off the disk holds it |
 | W2 | **DONE, floppy and QEMU only.** Enter os8088 by booting its floppy's boot sector; exit by Restart; save and restore the DOS text screen. | boots to the desktop under FreeDOS in QEMU; Restart returns to the prompt (MartyPC and v86 not yet) |
-| W3 | Read-only enforcement (5), and a `/W` switch that allows writes on a host with no disk cache that DOS reset can reach. | a write to the host volume is refused; the host `CHKDSK` is clean afterwards |
-| W4 | **MOSTLY DONE.** TSRs and real drivers, section 14. Still to do: MS-DOS, DR-DOS, FreeDOS 1.3, IBM DOS 3.30 (refused: it needs INT 25h's packet form, DOS 3.31+), SMARTDRV | `docs/TESTING.md` rows |
-| W5 | Real hardware: 5150, an AT, a machine with a mouse driver and a cache. | `docs/FIELD-MACHINES.md` |
-| W6 (optional) | MCB-aware image: skip free memory. | image size and round-trip time against the full image |
+| W3 | **DONE.** Read-only enforcement (5) and the `/W` switch. | a write to the host volume is refused; the host `CHKDSK` is clean afterwards |
+| W4 | **DONE for FreeDOS and SvarDOS.** TSRs and real drivers (section 14). Not done: MS-DOS, IBM DOS 3.x (the code path exists and is untested on a real one), SMARTDRV | `docs/TESTING.md` rows |
+| W5 | **NOT DONE: needs real hardware.** 5150, an AT, a machine with a mouse driver and a cache. | `docs/FIELD-MACHINES.md` |
+| W6 (optional) | **NOT DONE, and not worth doing yet:** MCB-aware image. The full image is a few seconds under QEMU and SPEC.md 87's own measurement is about 2 s on a real XT with an ST-225; do it if a field run says otherwise. | |
 
 ## 10. What would kill this
 
@@ -542,3 +555,83 @@ not a simple list of headers; it was dropped.
 - **SMARTDRV and write-behind caches**, which cannot be flushed from outside.
 - **Read-only enforcement**, which is still wave 3.
 - **QEMU only.** No MartyPC, 86Box, v86 or real 8086.
+
+## 15. Waves 3 and 4: A20, extended memory, writes, big disks, a hard-disk os8088, other DOSes, v86
+
+313 checks on two DOSes, about 14 minutes. Everything below is in `tests/dosguest.py`.
+
+**A20.** Saved at the snapshot with a wrap-around test run twice with different
+patterns; forced **on** for os8088 (a BIOS boot leaves it on, and an XMS driver may
+have left it off); put back on return. Methods in order: the ROM's `INT 15h`
+AX=2400/2401 through the saved vector, port 92h (never setting its reset bit), the
+keyboard controller; each verified by the wrap test. Tested: on at DOS with the
+return leaving it off (restored; the `/Z` control leaves DOS with it off), and off
+at DOS (os8088 boots anyway, DOS gets it off again).
+
+**Extended memory and XMS.** The measurement that justified the filter (4.5):
+under HIMEMX with the ROM's `INT 15h`, os8088's `XMEM.DRV` was wanted and resident
+at `9B80` - it had sized the manager's 6.8 MB. With the filter its row reads
+`(0, 0, 0)`; with `/X` it is loaded again. A 512 KB XMS block filled before os8088
+runs keeps its contents, and the manager still allocates, frees, grants the HMA and
+drives A20 exactly as it does with no launcher. **The XMS driver reported A20 still
+on after a global disable (its enable count stays above zero), so the comparison is
+against the driver's own answers with no launcher, not an assumed one.**
+
+**Writes.** The `INT 13h` filter (section 5). Tested through the live vector with
+the extended write at an unused sector of the swap file: refused by default
+(`AH=03 CF=1`, sector untouched); a bare `/W` does not allow a hard disk; `/WH` and
+`/W*` do. And an os8088 hard-disk install, booted from, is byte-for-byte unchanged
+afterwards. *The result must live in the hidden block: the launcher's own memory is
+rewound to the snapshot by the restore, which lost it the first time.*
+
+**Video modes.** Starting in each of 0, 1, 2, 7 (text), the same mode and marker come
+back; starting in 4, 0Dh, 12h, 13h (graphics), the host comes back in mode 3.
+
+**Big disks.** A sparse 10 GB disk with an MBR and a 100 MB FAT16 partition that
+starts at 8 GB (hidden sectors 16,777,216): the swap file lands past that LBA through
+the BIOS's extended `INT 13h`, DOS comes back, and `dgfat.py` agrees on the extents;
+`/C` (CHS only, the control) cannot reach it. This is also the first test with a
+partition table and a non-zero hidden-sector count.
+
+**DOS 3.0 to 3.30.** `INT 25h`'s classic form is used for the boot sector; a volume
+over 32 MB is out of reach there. `/3` forces the path on FreeDOS and the round trip
+works through it. **This is the path, not DOS 3.x: no DOS 3.x was available.**
+
+**A hard-disk os8088** (`DG D:`, 4.4). Booted from BIOS unit 81h; Restart returns.
+
+**Other DOSes.**
+
+| DOS | result |
+|---|---|
+| FreeDOS 1.4 | everything passes, including the real drivers |
+| SvarDOS 20250427 (an **Enhanced DR-DOS** kernel, a different family) | everything but the FreeDOS driver packages passes. It leaves INT 08h in the ROM; the scan unwraps one vector |
+| MS-DOS | **not tried**: no image, and none was fetched from a source of unclear licence |
+| IBM DOS 3.30 | **not tried**: the owner has an image (docs/DOS-DEBUGGING.md); the classic `INT 25h` path exists for it |
+
+**v86** (`tests/dosguest_v86.mjs`, node). FreeDOS, `kern_emu`'s os8088 with the
+absolute pointer, Restart by a mouse-absolute click: os8088 up in 3 s, DOS back in
+11 s, memory and IVT restored. **`tools/dosguest_demo.py`** builds a directory a
+browser can open (the images, `libv86.js`, the BIOSes and a page); the test runs
+that same directory by TYPING `DG B:` at its prompt and checks the DOS banner is
+back after Restart. **It has not been opened in a browser.** Two v86 facts: boot
+order `0x123` is CD, hard disk, floppy (the first digit is first), so floppy first
+is `0x321`; and `read_memory` does not see video RAM, `screen_adapter.get_text_screen`
+does.
+
+**The launcher printed a 40-line report** that scrolled the user's own restored
+screen away. It prints one line now; `/V` prints the report.
+
+**Not done, and not claimed:**
+
+- **MS-DOS, IBM DOS 3.x, any DOS beyond the two.** The vector scan and the driver
+  tests are only as general as two DOS families and seven packages.
+- **Device state os8088 reprograms**: the PS/2 or serial mouse, the PIT's channel 0
+  rate, a sound card. A DOS driver for one of those may need re-initialising after
+  the return; CTMOUSE's answers to `INT 33h AX=0` were checked, its tracking was not.
+- **SMARTDRV and other caches whose contents cannot be flushed from outside.**
+- **A hook that chains by pushing the old vector and returning**, which the scan
+  cannot see and the launcher refuses by name.
+- **An emulated 8088, MartyPC, 86Box or real hardware.** The launcher is 8086 code
+  and QEMU runs it on a 386; only `check_real_mode` is written to tell the two apart.
+- **A browser.** See v86 above.
+- **Version 2, the pass-through driver** (section 8): a separate PR.

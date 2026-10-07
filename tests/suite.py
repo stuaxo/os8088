@@ -4200,7 +4200,7 @@ SOAK = [
         "without vstart=0, a near `ret` under a FAR call, and the ON-DISK "
         "record offsets read out of a SYNTHESIZED entry.",
         needs=("marty",), serial=True),
-    Row("dosguest", "soak", py("tests/dosguest.py"), 270.0,
+    Row("dosguest", "soak", py("tests/dosguest.py"), 1050.0,
         "DOS IS SUSPENDED TO A FILE AND PUT BACK (docs/plans/DOSGUEST-PLAN.md "
         "wave 1): dosguest/dg.asm, under a REAL FreeDOS in QEMU, takes a hidden "
         "block off the top of the arena (int 12h then answers the smaller "
@@ -4234,8 +4234,17 @@ SOAK = [
         "driver identical afterwards, SHARE/NANSI/KEYB/LBACACHE accepted, "
         "JEMM386 refused as V86 - and a file the HOST adds to C: while os8088 "
         "runs, which DOS cannot see unless it is told to re-read. "
-        "SOAK, about 4.5 minutes: it boots fourteen guests, and needs a DOS "
-        "that is fetched, not shipped (`python3 tools/getfreedos.py --pkgs`)",
+        "THEN, ON TWO DOS HOSTS AND A SECOND EMULATOR: A20 (saved, forced on for "
+        "os8088, put back), extended memory hidden from os8088 by an INT 15h "
+        "filter so XMEM.DRV does not load on an XMS manager, os8088's WRITES "
+        "REFUSED by an INT 13h filter, a partition 8 GB into a 10 GB disk "
+        "(extended INT 13h), every BIOS video mode, os8088 booted from a HARD "
+        "disk, SvarDOS (an Enhanced DR-DOS kernel) as a second host, and the "
+        "whole boot-and-Restart under v86 in node - including a demo "
+        "directory run by TYPING `DG B:`. "
+        "SOAK, about 17 minutes: it boots some sixty guests, and needs a DOS "
+        "that is fetched, not shipped (`python3 tools/getfreedos.py --pkgs "
+        "--svardos`); v86 and `make emu` are optional and skip",
         needs=("nasm", "qemu", "mtools", "freedos"),
         wants=("build/os8088.img",)),
     Row("kdos", "soak", py("tests/kdos.py"), 10.0,
